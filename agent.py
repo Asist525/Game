@@ -17,8 +17,8 @@ BOARD_W = 600.0
 BOARD_H = 600.0
 
 # 디스크리트 액션 설정 (self-play, PPO에서 사용할 수 있도록)
-N_ANGLES = 8   # 방향 개수
-N_POWERS = 4   # 파워 단계
+N_ANGLES = 32   # 방향 개수
+N_POWERS = 6   # 파워 단계
 N_ACTIONS = N_STONES * N_ANGLES * N_POWERS
 
 
@@ -191,7 +191,7 @@ def obstacle_summary(obs_norm: np.ndarray) -> np.ndarray:
     """
     obs_norm: (N_OBS, 4) = [x_norm, y_norm, w_norm, h_norm]
 
-    - count
+    - count (정규화: /3)
     - center_x_mean, center_y_mean
     - w_mean, h_mean
 
@@ -205,9 +205,10 @@ def obstacle_summary(obs_norm: np.ndarray) -> np.ndarray:
     w = obs_norm[:, 2]
     h = obs_norm[:, 3]
 
-    cnt = float(obs_norm.shape[0])
+    cnt_norm = float(obs_norm.shape[0]) / 3.0
+
     return np.array(
-        [cnt, cx.mean(), cy.mean(), w.mean(), h.mean()],
+        [cnt_norm, cx.mean(), cy.mean(), w.mean(), h.mean()],
         dtype=np.float32,
     )
 
@@ -248,10 +249,21 @@ def encode_state_fe_alkkagi(
     # env 기준 턴(0=흑,1=백)과 my_color 비교
     turn_is_me = 1.0 if int(turn_raw) == int(my_color) else 0.0
 
+    my_alive_norm = my_alive_cnt / 3.0
+    opp_alive_norm = opp_alive_cnt / 3.0
+    alive_diff_norm = (my_alive_cnt - opp_alive_cnt) / 3.0
+
     scalar_feats = np.array(
-        [turn_is_me, my_alive_cnt / 3.0, opp_alive_cnt / 3.0, alive_diff / 3.0, alive_ratio],
+        [
+            turn_is_me,
+            my_alive_norm,
+            opp_alive_norm,
+            alive_diff_norm,
+            alive_ratio,
+        ],
         dtype=np.float32,
     )
+
 
     my_stats = group_stats(me_norm)   # (4,)
     op_stats = group_stats(opp_norm)  # (4,)
@@ -315,7 +327,7 @@ def decode_action_index(action_idx: int):
     power_id = rem % N_POWERS
 
     angle_step = 360.0 / N_ANGLES
-    angle = -180.0 + (angle_id + 0.5) * angle_step
+    angle = -180.0 + angle_id * angle_step
 
     # 여기 수정
     power_min, power_max = 500.0, 2500.0  # 예: 500 이상만 허용
@@ -375,19 +387,23 @@ def idx_to_action(action_idx: int, obs) -> Dict[str, Any]:
 class ActorCritic(nn.Module):
     def __init__(self, state_dim=STATE_DIM, n_actions=N_ACTIONS):
         super().__init__()
+
         self.shared = nn.Sequential(
-            nn.Linear(state_dim, 128),
+            nn.Linear(state_dim, 256),
             nn.ReLU(),
-            nn.Linear(128, 128),
+            nn.Linear(256, 256),
+            nn.ReLU(),
+            nn.Linear(256, 128),
             nn.ReLU(),
         )
+
         self.pi_head = nn.Linear(128, n_actions)
         self.v_head = nn.Linear(128, 1)
 
     def forward(self, x: torch.Tensor):
         h = self.shared(x)
         logits = self.pi_head(h)
-        value = self.v_head(h).squeeze(-1)  # (batch,)
+        value = self.v_head(h).squeeze(-1)
         return logits, value
 
     def act(self, state: torch.Tensor, deterministic: bool = False):
@@ -426,7 +442,7 @@ class ActorCritic(nn.Module):
 # ============================================================
 class PPORolloutBuffer:
     def __init__(self, state_dim: int, size: int):
-        #self.size = size
+        # self.size = size  # 아직 안 씀
         self.state_dim = state_dim
         self.reset()
 
@@ -437,17 +453,19 @@ class PPORolloutBuffer:
         self.rewards = []
         self.dones = []
         self.values = []
+        self.is_learner = []   # <-- 추가
 
     def __len__(self):
         return len(self.states)
 
-    def add(self, state, action, logprob, reward, done, value):
+    def add(self, state, action, logprob, reward, done, value, is_learner: bool):
         self.states.append(state.astype(np.float32))
         self.actions.append(int(action))
         self.logprobs.append(float(logprob))
         self.rewards.append(float(reward))
         self.dones.append(bool(done))
         self.values.append(float(value))
+        self.is_learner.append(bool(is_learner))   # <-- 추가
 
     def to_tensors(self, device):
         states = torch.from_numpy(np.stack(self.states)).float().to(device)
@@ -456,7 +474,8 @@ class PPORolloutBuffer:
         rewards = torch.tensor(self.rewards, dtype=torch.float32, device=device)
         dones = torch.tensor(self.dones, dtype=torch.float32, device=device)
         values = torch.tensor(self.values, dtype=torch.float32, device=device)
-        return states, actions, logprobs, rewards, dones, values
+        is_learner = torch.tensor(self.is_learner, dtype=torch.float32, device=device)
+        return states, actions, logprobs, rewards, dones, values, is_learner
 
 
 def compute_gae(
@@ -501,7 +520,7 @@ def ppo_update(
     ent_coef: float = 0.01,
     max_grad_norm: float = 0.5,
 ):
-    states, actions, old_logprobs, rewards, dones, values = buffer.to_tensors(device)
+    states, actions, old_logprobs, rewards, dones, values, is_learner = buffer.to_tensors(device)
 
     returns, advantages = compute_gae(rewards, dones, values, gamma, lam)
     advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
@@ -520,16 +539,30 @@ def ppo_update(
             b_old_logprob = old_logprobs[batch_idx]
             b_returns = returns[batch_idx]
             b_advantages = advantages[batch_idx]
+            b_is_learner = is_learner[batch_idx]
 
             logprobs, entropy, values_pred = model.evaluate_actions(b_states, b_actions)
-            ratio = torch.exp(logprobs - b_old_logprob)
 
-            surr1 = ratio * b_advantages
-            surr2 = torch.clamp(ratio, 1.0 - clip_coef, 1.0 + clip_coef) * b_advantages
-            policy_loss = -torch.min(surr1, surr2).mean()
-
+            # --- Value loss: 전체 스텝 사용 ---
             value_loss = F.mse_loss(values_pred, b_returns)
-            entropy_loss = -entropy.mean()
+
+            # --- Policy / Entropy: learner 턴만 사용 ---
+            learner_mask = b_is_learner > 0.5
+            if learner_mask.any():
+                lp_l = logprobs[learner_mask]
+                old_lp_l = b_old_logprob[learner_mask]
+                adv_l = b_advantages[learner_mask]
+                ent_l = entropy[learner_mask]
+
+                ratio = torch.exp(lp_l - old_lp_l)
+                surr1 = ratio * adv_l
+                surr2 = torch.clamp(ratio, 1.0 - clip_coef, 1.0 + clip_coef) * adv_l
+                policy_loss = -torch.min(surr1, surr2).mean()
+                entropy_loss = -ent_l.mean()
+            else:
+                # 이 배치 안에 learner 턴이 없으면 policy/entropy는 0으로
+                policy_loss = torch.tensor(0.0, device=device)
+                entropy_loss = torch.tensor(0.0, device=device)
 
             loss = policy_loss + vf_coef * value_loss + ent_coef * entropy_loss
 
@@ -548,7 +581,8 @@ def ppo_update(
 def train_selfplay_ppo(
     num_episodes: int = 5000,
     rollout_size: int = 2048,
-    opponent_update_interval: int = 50,
+    opponent_update_interval: int = 500,
+    save_interval_episodes: int = 10000,   # <-- 추가
 ):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print("Device:", device)
@@ -561,7 +595,6 @@ def train_selfplay_ppo(
     opponent_model.eval()
 
     optimizer = optim.Adam(model.parameters(), lr=3e-4)
-
     buffer = PPORolloutBuffer(state_dim=STATE_DIM, size=rollout_size)
 
     global_step = 0
@@ -571,54 +604,68 @@ def train_selfplay_ppo(
         obs, info = env.reset()
         done = False
 
-        # 에피소드마다 내가 어떤 색을 담당할지 랜덤
-        learner_color = np.random.randint(0, 2)   # 0=흑, 1=백
+        learner_color = np.random.randint(0, 2)
         opponent_color = 1 - learner_color
 
-        # 이 에피소드에서 learner의 trajectory
         ep_states = []
         ep_actions = []
         ep_logprobs = []
         ep_values = []
         ep_rewards = []
         ep_dones = []
+        ep_is_learner = []
 
         while not done:
             turn_color = int(obs["turn"])
 
+            state_np_learner = encode_state_fe_alkkagi(
+                obs, learner_color, BOARD_W, BOARD_H
+            )
+            state_t_learner = torch.from_numpy(state_np_learner).float().to(device)
+
             if turn_color == learner_color:
-                # -------- Learner 턴 --------
-                state_np = encode_state_fe_alkkagi(obs, learner_color, BOARD_W, BOARD_H)
-                state_t = torch.from_numpy(state_np).float().to(device)
-
                 model.train()
-                action_t, logprob_t, value_t = model.act(state_t, deterministic=False)
-
+                action_t, logprob_t, value_t = model.act(
+                    state_t_learner, deterministic=False
+                )
                 action_idx = int(action_t.item())
                 env_action = idx_to_action(action_idx, obs)
 
                 next_obs, _, terminated, truncated, info = env.step(env_action)
                 done = terminated or truncated
 
-                # 중간에는 reward 0, done=False, 에피소드 끝난 후 마지막에만 승패 reward 부여
-                ep_states.append(state_np)
+                ep_states.append(state_np_learner)
                 ep_actions.append(action_idx)
                 ep_logprobs.append(float(logprob_t.item()))
                 ep_values.append(float(value_t.item()))
                 ep_rewards.append(0.0)
                 ep_dones.append(False)
+                ep_is_learner.append(True)
 
                 obs = next_obs
 
             else:
-                # -------- Opponent 턴 (frozen policy, gradient X) --------
-                state_np_opp = encode_state_fe_alkkagi(obs, opponent_color, BOARD_W, BOARD_H)
+                with torch.no_grad():
+                    value_t = model.forward(state_t_learner)[1]
+
+                ep_states.append(state_np_learner)
+                ep_actions.append(0)
+                ep_logprobs.append(0.0)
+                ep_values.append(float(value_t.item()))
+                ep_rewards.append(0.0)
+                ep_dones.append(False)
+                ep_is_learner.append(False)
+
+                state_np_opp = encode_state_fe_alkkagi(
+                    obs, opponent_color, BOARD_W, BOARD_H
+                )
                 state_opp_t = torch.from_numpy(state_np_opp).float().to(device)
 
                 opponent_model.eval()
                 with torch.no_grad():
-                    action_opp_t, _, _ = opponent_model.act(state_opp_t, deterministic=False)
-
+                    action_opp_t, _, _ = opponent_model.act(
+                        state_opp_t, deterministic=False
+                    )
                 action_idx_opp = int(action_opp_t.item())
                 env_action_opp = idx_to_action(action_idx_opp, obs)
 
@@ -626,15 +673,14 @@ def train_selfplay_ppo(
                 done = terminated or truncated
                 obs = next_obs
 
-        # 에피소드 종료 후, learner의 마지막 step에 승패 보상 부여
         if len(ep_states) > 0:
             final_reward = compute_win_loss_reward(obs, learner_color)
             ep_rewards[-1] = final_reward
             ep_dones[-1] = True
 
-            # 에피소드 trajectory를 PPO buffer에 push
-            for s, a, lp, v, r, d in zip(
-                ep_states, ep_actions, ep_logprobs, ep_values, ep_rewards, ep_dones
+            for s, a, lp, v, r, d, is_l in zip(
+                ep_states, ep_actions, ep_logprobs,
+                ep_values, ep_rewards, ep_dones, ep_is_learner
             ):
                 buffer.add(
                     state=np.asarray(s, dtype=np.float32),
@@ -643,10 +689,10 @@ def train_selfplay_ppo(
                     reward=r,
                     done=d,
                     value=v,
+                    is_learner=is_l,
                 )
                 global_step += 1
 
-        # rollout_size만큼 모이면 PPO 업데이트
         if len(buffer) >= rollout_size:
             ppo_update(
                 model=model,
@@ -665,11 +711,9 @@ def train_selfplay_ppo(
             buffer.reset()
             update_count += 1
 
-            # 일정 간격마다 opponent_model 갱신 (self-play용)
             if update_count % opponent_update_interval == 0:
                 opponent_model.load_state_dict(model.state_dict())
 
-        # 로그 출력
         ep_return = sum(ep_rewards) if len(ep_rewards) > 0 else 0.0
         if (ep + 1) % 100 == 0:
             print(
@@ -678,10 +722,18 @@ def train_selfplay_ppo(
                 f"buffer_len={len(buffer)}"
             )
 
+        # =============== ★ 추가된 부분 ★ ===============
+        if (ep + 1) % save_interval_episodes == 0:
+            ckpt_path = f"alkkagi_ppo_ep_{ep+1}.pt"
+            torch.save(model.state_dict(), ckpt_path)
+            print(f"[Checkpoint] Saved model to {ckpt_path}")
+        # ===============================================
+
     env.close()
-    # 학습된 모델 저장 예시
-    torch.save(model.state_dict(), "alkkagi_ppo_selfplay.pt")
-    print("Training finished, model saved to alkkagi_ppo_selfplay.pt")
+
+    # 마지막 저장
+    torch.save(model.state_dict(), "alkkagi_ppo_final.pt")
+    print("Training finished. Saved final model to alkkagi_ppo_final.pt")
 
 
 # ============================================================
@@ -788,7 +840,8 @@ class YourWhiteAgent(BaseAlkkagiAgent):
 
 if __name__ == "__main__":
     train_selfplay_ppo(
-        num_episodes=50000,
+        num_episodes=100000000,
         rollout_size=2048,
-        opponent_update_interval=50,  # 현재 코드는 매 업데이트 때 opponent sync
+        opponent_update_interval=10,
+        save_interval_episodes=10000,   # ← 명시적으로 넣기
     )

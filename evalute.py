@@ -1,11 +1,11 @@
 import gymnasium as gym
 import kymnasium as kym
 
-from agent_submission import YourBlackAgent, YourWhiteAgent
+from agent import YourBlackAgent, YourWhiteAgent
 
 # checkpoint paths
-black_ckpt = r"C:\Users\Samsung\Desktop\avoid\checkpoints_alkkagi\episode0007_champion_team3.pt"
-white_ckpt = r"C:\Users\Samsung\Desktop\avoid\checkpoints_alkkagi\episode0006_champion_team6.pt"
+black_ckpt = r"/home/ubuntu/alkhagi/Game/alkkagi_ppo_selfplay.pt"
+white_ckpt = r"/home/ubuntu/alkhagi/Game/alkkagi_ppo_selfplay.pt"
 
 black = YourBlackAgent.load(black_ckpt)
 white = YourWhiteAgent.load(white_ckpt)
@@ -21,11 +21,15 @@ obs, info = env.reset()
 done = False
 
 while not done:
+    print("turn:", obs["turn"])
     if obs["turn"] == 0:
+        print("  >> Black turn")
         action = black.act(obs, info)
     else:
+        print("  >> White turn")
         action = white.act(obs, info)
 
+    print("  action:", action)
     obs, reward, terminated, truncated, info = env.step(action)
     done = terminated or truncated
 

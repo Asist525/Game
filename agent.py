@@ -4,7 +4,7 @@ import gymnasium as gym
 import kymnasium as kym  # env 등록용
 import numpy as np
 import torch
-from typing import Any, Dict
+from typing import Any, Dict, List, Tuple
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -12,6 +12,7 @@ from dataclasses import dataclass
 import torch.optim as optim
 import os
 from pathlib import Path
+
 
 
 # ------------------------------------------------
@@ -947,15 +948,6 @@ class YourWhiteAgent(kym.Agent):
         return cls(policy=policy, device=policy.device)
 
 
-
-
-
-
-
-from dataclasses import dataclass
-from typing import List, Tuple
-
-
 @dataclass
 class RatedPolicy:
     """
@@ -1048,10 +1040,6 @@ class EloLeague:
         pb.rating = rb_new
         pa.games += 1
         pb.games += 1
-
-
-
-
 
 
 
@@ -1300,11 +1288,6 @@ def train_league_selfplay(
     return learner, league
 
 
-
-
-
-# agent.py 맨 아래쪽에 추가
-
 def main_train():
     """
     학습 전용 엔트리포인트.
@@ -1339,7 +1322,6 @@ def main_train():
     learner.save(weight_path)
     print(f"[TRAIN DONE] Saved learner policy to '{weight_path}'")
 
-    # 리그 상태도 한 번 출력해보자
     print("\n=== Final League Ratings ===")
     for p in league.players:
         print(f"id={p.id}, rating={p.rating:.1f}, games={p.games}")

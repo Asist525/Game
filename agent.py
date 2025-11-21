@@ -872,17 +872,17 @@ def train_selfplay_shared_ppo(
             all_advantages.extend(adv_w.tolist())
             all_returns.extend(ret_w.tolist())
 
-        print(
-            f"[Ep {ep+1:03d}/{num_episodes:03d}] "
-            f"steps={step}, R_black={R_black:.2f}, R_white={R_white:.2f}, "
-            f"transitions_B={len(rewards_black)}, W={len(rewards_white)}"
-        )
+        # print(
+        #     f"[Ep {ep+1:03d}/{num_episodes:03d}] "
+        #     f"steps={step}, R_black={R_black:.2f}, R_white={R_white:.2f}, "
+        #     f"transitions_B={len(rewards_black)}, W={len(rewards_white)}"
+        # )
 
     env.close()
 
     # 수집된 전체 transition으로 PPO 한 번(or 여러 번) 업데이트
     if len(all_states) > 0:
-        print(f"\n[ PPO UPDATE ] total transitions = {len(all_states)}")
+        # print(f"\n[ PPO UPDATE ] total transitions = {len(all_states)}")
         ppo_update(
             policy=policy,
             states=all_states,
@@ -893,7 +893,8 @@ def train_selfplay_shared_ppo(
             config=config,
         )
     else:
-        print("수집된 transition이 없습니다.")
+        # print("수집된 transition이 없습니다.")
+        pass
 
     return policy
 
@@ -1103,7 +1104,7 @@ def train_league_selfplay(
         ep_step_sum = 0
         episodes_this_epoch = 0
 
-        print(f"\n===== [Epoch {epoch+1}/{num_epochs}] =====")
+        # print(f"\n===== [Epoch {epoch+1}/{num_epochs}] =====")
         for ep in range(episodes_per_epoch):
             # --- opponent 선택 (learner와 rating 가까운 상대) ---
             opponent = league.choose_opponent("learner")
@@ -1193,14 +1194,14 @@ def train_league_selfplay(
             learner_idx = league.find_index("learner")
             learner_rating = league.players[learner_idx].rating
 
-            print(
-                f"[Ep {epoch+1:02d}-{ep+1:03d}] "
-                f"steps={step}, learner_color={learner_color}, "
-                f"R_learner={R_learner:.2f}, score={score_a:.1f}, "
-                f"opp_id={opponent.id}, "
-                f"learner_rating={learner_rating:.1f}, "
-                f"opp_rating={opponent.rating:.1f}"
-            )
+            # print(
+            #     f"[Ep {epoch+1:02d}-{ep+1:03d}] "
+            #     f"steps={step}, learner_color={learner_color}, "
+            #     f"R_learner={R_learner:.2f}, score={score_a:.1f}, "
+            #     f"opp_id={opponent.id}, "
+            #     f"learner_rating={learner_rating:.1f}, "
+            #     f"opp_rating={opponent.rating:.1f}"
+            # )
 
         # ---- 에폭 요약 지표 계산 ----
         if episodes_this_epoch > 0:
@@ -1217,14 +1218,14 @@ def train_league_selfplay(
         num_players = len(league.players)
 
         # 콘솔 요약 출력
-        print(
-            f"[Epoch {epoch+1}] SUMMARY: "
-            f"W/D/L={ep_wins}/{ep_draws}/{ep_losses} "
-            f"(win_rate={win_rate:.3f}), "
-            f"avg_R={avg_R:.2f}, avg_steps={avg_steps:.2f}, "
-            f"learner_rating={learner_rating:.1f}, "
-            f"num_players={num_players}"
-        )
+        # print(
+        #     f"[Epoch {epoch+1}] SUMMARY: "
+        #     f"W/D/L={ep_wins}/{ep_draws}/{ep_losses} "
+        #     f"(win_rate={win_rate:.3f}), "
+        #     f"avg_R={avg_R:.2f}, avg_steps={avg_steps:.2f}, "
+        #     f"learner_rating={learner_rating:.1f}, "
+        #     f"num_players={num_players}"
+        # )
 
         # CSV에 기록
         append_epoch_log(
@@ -1242,7 +1243,7 @@ def train_league_selfplay(
 
         # ---- epoch 끝: PPO 업데이트 ----
         if len(all_states) > 0:
-            print(f"[Epoch {epoch+1}] PPO UPDATE: total transitions = {len(all_states)}")
+            # print(f"[Epoch {epoch+1}] PPO UPDATE: total transitions = {len(all_states)}")
             ppo_update(
                 policy=learner,
                 states=all_states,
@@ -1253,7 +1254,8 @@ def train_league_selfplay(
                 config=config,
             )
         else:
-            print(f"[Epoch {epoch+1}] 수집된 transition이 없습니다.")
+            # print(f"[Epoch {epoch+1}] 수집된 transition이 없습니다.")
+            pass
 
         # ---- 체크포인트 저장 (예: 5000 epoch마다) ----
         if (epoch + 1) % checkpoint_interval == 0:
@@ -1263,7 +1265,7 @@ def train_league_selfplay(
                 checkpoint_dir=checkpoint_dir,
                 max_keep=max_checkpoints,
             )
-            print(f"[Epoch {epoch+1}] Checkpoint saved to {ckpt_path}")
+            # print(f"[Epoch {epoch+1}] Checkpoint saved to {ckpt_path}")
 
         # ---- snapshot 저장 (interval마다) ----
         if (epoch + 1) % snapshot_interval == 0:
@@ -1282,7 +1284,7 @@ def train_league_selfplay(
                     games=0,
                 )
             )
-            print(f"[Epoch {epoch+1}] New snapshot added: {snap_id} (rating={learner_rating:.1f})")
+            # print(f"[Epoch {epoch+1}] New snapshot added: {snap_id} (rating={learner_rating:.1f})")
 
     env.close()
     return learner, league
@@ -1307,12 +1309,12 @@ def main_train():
     )
 
     learner, league = train_league_selfplay(
-        num_epochs=1000,
-        episodes_per_epoch=50,
-        snapshot_interval=2,
+        num_epochs=2000,
+        episodes_per_epoch=100,
+        snapshot_interval=20,
         config=config,
         checkpoint_dir="checkpoints",
-        checkpoint_interval=500,
+        checkpoint_interval=200,
         max_checkpoints=20,
         log_path="training_metrics.csv",
     )
@@ -1320,12 +1322,12 @@ def main_train():
     # 최종 learner 정책 저장
     weight_path = "shared_policy.pt"
     learner.save(weight_path)
-    print(f"[TRAIN DONE] Saved learner policy to '{weight_path}'")
+    # print(f"[TRAIN DONE] Saved learner policy to '{weight_path}'")
 
-    print("\n=== Final League Ratings ===")
+    # print("\n=== Final League Ratings ===")
     for p in league.players:
-        print(f"id={p.id}, rating={p.rating:.1f}, games={p.games}")
-
+        # print(f"id={p.id}, rating={p.rating:.1f}, games={p.games}")
+        pass
 
 if __name__ == "__main__":
     # 이 파일을 직접 실행하면 학습 모드로 돌도록

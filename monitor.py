@@ -103,6 +103,56 @@ def summarize(metrics: List[Dict[str, Any]], last_n: int):
     }
 
 
+def compute_status(info: Dict[str, Any]) -> tuple[str, str]:
+    """
+    GREEN / YELLOW / RED 상태 판정 + 간단한 이유 텍스트.
+
+    기준(최근 LAST_N_EPOCHS):
+      - win_rate
+      - avg_reward
+      - rating vs best_rating
+    """
+    recent_win = info["recent_win_rate"]      # 0~1
+    recent_rew = info["recent_avg_reward"]    # 대략 [-3,3]
+    recent_rating = info["recent_rating"]
+    best_rating = info["best_rating"]
+    rating_drop = best_rating - recent_rating
+
+    status = "GREEN"
+    reasons: list[str] = []
+
+    # --- RED 조건 ---
+    if recent_win < 0.40:
+        status = "RED"
+        reasons.append(f"win_rate<{40}% (현재 {recent_win*100:.1f}%)")
+    if recent_rew < -0.2:
+        status = "RED"
+        reasons.append(f"avg_reward<-0.2 (현재 {recent_rew:.3f})")
+    if rating_drop > 80:
+        status = "RED"
+        reasons.append(f"rating {rating_drop:.1f}점 하락 (best={best_rating:.1f} → now={recent_rating:.1f})")
+
+    # --- YELLOW 조건 (RED가 아닐 때만) ---
+    if status != "RED":
+        if 0.40 <= recent_win < 0.50:
+            status = "YELLOW"
+            reasons.append(f"win_rate 40~50% 구간 (현재 {recent_win*100:.1f}%)")
+        if -0.2 <= recent_rew < 0.05:
+            status = "YELLOW"
+            reasons.append(f"avg_reward -0.2~0.05 구간 (현재 {recent_rew:.3f})")
+        if 40 < rating_drop <= 80:
+            status = "YELLOW"
+            reasons.append(f"rating best 대비 {rating_drop:.1f}점 하락")
+
+    if not reasons:
+        reasons.append(
+            f"win_rate={recent_win*100:.1f}%, avg_reward={recent_rew:.3f}, "
+            f"rating={recent_rating:.1f} (best={best_rating:.1f})"
+        )
+
+    return status, "; ".join(reasons)
+
+
 def print_dashboard(metrics: List[Dict[str, Any]]):
     clear_screen()
 
@@ -117,6 +167,8 @@ def print_dashboard(metrics: List[Dict[str, Any]]):
         return
 
     last = info["last"]
+    status, status_reason = compute_status(info)
+    recent_window = min(LAST_N_EPOCHS, info["total_epochs"])
 
     print("====================================")
     print(" RL League Self-Play Training Monitor")
@@ -125,7 +177,7 @@ def print_dashboard(metrics: List[Dict[str, Any]]):
     print(f"Total epochs      : {info['total_epochs']}")
     print(f"Total episodes    : {info['total_episodes']}")
     print(f"Num league players: {info['num_players']}")
-    print(f"Recent window     : last {min(LAST_N_EPOCHS, info['total_epochs'])} epochs")
+    print(f"Recent window     : last {recent_window} epochs")
     print("------------------------------------\n")
 
     # 마지막 에폭 상세
@@ -148,35 +200,25 @@ def print_dashboard(metrics: List[Dict[str, Any]]):
     print()
 
     # 최근 N 에폭 요약
-    print(f"[Recent {min(LAST_N_EPOCHS, info['total_epochs'])} Epochs Summary]")
-    print(
-        f"Recent episodes   : {info['recent_episodes']}"
-    )
-    print(
-        f"Recent win_rate   : {info['recent_win_rate']*100:6.2f}%"
-    )
-    print(
-        f"Recent avg_reward : {info['recent_avg_reward']:8.4f}"
-    )
-    print(
-        f"Recent avg_steps  : {info['recent_avg_steps']:8.2f}"
-    )
-    print(
-        f"Recent rating     : {info['recent_rating']:8.2f}"
-    )
+    print(f"[Recent {recent_window} Epochs Summary]")
+    print(f"Recent episodes   : {info['recent_episodes']}")
+    print(f"Recent win_rate   : {info['recent_win_rate']*100:6.2f}%")
+    print(f"Recent avg_reward : {info['recent_avg_reward']:8.4f}")
+    print(f"Recent avg_steps  : {info['recent_avg_steps']:8.2f}")
+    print(f"Recent rating     : {info['recent_rating']:8.2f}")
     print()
 
     # 전체 누적 요약
     print("[Overall Summary]")
-    print(
-        f"Total W/D/L       : {info['total_wins']}/{info['total_draws']}/{info['total_losses']}"
-    )
-    print(
-        f"Overall win_rate  : {info['overall_win_rate']*100:6.2f}%"
-    )
-    print(
-        f"Best rating       : {info['best_rating']:8.2f}"
-    )
+    print(f"Total W/D/L       : {info['total_wins']}/{info['total_draws']}/{info['total_losses']}")
+    print(f"Overall win_rate  : {info['overall_win_rate']*100:6.2f}%")
+    print(f"Best rating       : {info['best_rating']:8.2f}")
+    print()
+
+    # 상태 진단
+    print("[Status Assessment]")
+    print(f"Status (last {recent_window} epochs): {status}")
+    print(f"Reason: {status_reason}")
     print("\n(CTRL+C 로 종료)\n")
 
 

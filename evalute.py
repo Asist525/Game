@@ -1,36 +1,41 @@
+# evaluate.py
 import gymnasium as gym
-import kymnasium as kym
+import kymnasium as kym  # env 등록용
 
 from agent import YourBlackAgent, YourWhiteAgent
 
-# checkpoint paths
-black_ckpt = "/home/ubuntu/alkhagi/Game/alkkagi_ppo_ep_40000.pt"
-white_ckpt = "/home/ubuntu/alkhagi/Game/alkkagi_ppo_ep_40000.pt"
 
-black = YourBlackAgent.load(black_ckpt)
-white = YourWhiteAgent.load(white_ckpt)
+def main(render_mode: str = "human"):
+    env = gym.make(
+        id="kymnasium/AlKkaGi-3x3-v0",
+        render_mode=render_mode,
+        obs_type="custom",
+        bgm=True,
+    )
 
-env = gym.make(
-    id='kymnasium/AlKkaGi-3x3-v0',
-    render_mode='human',
-    obs_type='custom',
-    bgm=False,
-)
+    # 학습 때 agent.py에서 저장한 weight 파일
+    weight_path = "shared_policy.pt"
 
-obs, info = env.reset()
-done = False
+    agent_black = YourBlackAgent.load(weight_path)
+    agent_white = YourWhiteAgent.load(weight_path)
 
-while not done:
-    print("turn:", obs["turn"])
-    if obs["turn"] == 0:
-        print("  >> Black turn")
-        action = black.act(obs, info)
-    else:
-        print("  >> White turn")
-        action = white.act(obs, info)
+    obs, info = env.reset()
+    done = False
+    step = 0
 
-    print("  action:", action)
-    obs, reward, terminated, truncated, info = env.step(action)
-    done = terminated or truncated
+    while not done:
+        if obs["turn"] == 0:
+            action = agent_black.act(obs, info)
+        else:
+            action = agent_white.act(obs, info)
 
-env.close()
+        obs, reward, terminated, truncated, info = env.step(action)
+        done = terminated or truncated
+        step += 1
+
+    env.close()
+    print(f"[EVAL] episode finished in {step} steps")
+
+
+if __name__ == "__main__":
+    main(render_mode="human")  # 학습 중 디버그면 None으로 돌려도 됨

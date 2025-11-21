@@ -6,6 +6,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
 from typing import Any, Dict
+import os
 
 # ============================================================
 # 0. 기본 상수 / 환경
@@ -16,9 +17,27 @@ N_OBS = 3
 BOARD_W = 600.0
 BOARD_H = 600.0
 
+# ============================================================
+# PPO / Reward Shaping 하이퍼파라미터
+# ============================================================
+GAMMA = 0.99          # PPO에서 쓰는 gamma와 shaping gamma를 일치
+
+WIN_REWARD = 100.0    # 승/패 보상 스케일 (이기면 +100, 지면 -100)
+
+# Φ_alive(s) = α * alive_diff - β * total_alive
+ALIVE_ALPHA = 1.0
+ALIVE_BETA  = 0.3
+ALIVE_LAMBDA = 1.0    # r_total에 곱해줄 λ_alive
+
+# Ψ_pos(s) = -γ_d * min_my_op_dist(s)
+POS_GAMMA_D  = 1.0
+# 초기에는 0.0으로 두고, 필요할 때 0.05~0.1까지 올려보기
+POS_LAMBDA   = 0.0    # r_total에 곱해줄 λ_pos
+
+
 # 디스크리트 액션 설정 (self-play, PPO에서 사용할 수 있도록)
 N_ANGLES = 32   # 방향 개수
-N_POWERS = 6   # 파워 단계
+N_POWERS = 6    # 파워 단계
 N_ACTIONS = N_STONES * N_ANGLES * N_POWERS
 
 
@@ -33,7 +52,7 @@ def make_env():
 
 
 # ============================================================
-# 1. 관측 전처리 / 인코더 (네가 만든 코드 기반)
+# 1. 관측 전처리 / 인코더
 # ============================================================
 def split_me_opp(obs, my_color: int):
     """
@@ -264,7 +283,6 @@ def encode_state_fe_alkkagi(
         dtype=np.float32,
     )
 
-
     my_stats = group_stats(me_norm)   # (4,)
     op_stats = group_stats(opp_norm)  # (4,)
 
@@ -295,26 +313,90 @@ STATE_DIM = 52
 
 
 # ============================================================
-# 2. 승패 기반 sparse 보상 (끝에서만 ±1 / 0)
+# 2. Reward 설계: 승/패 + potential-based shaping
 # ============================================================
 def compute_win_loss_reward(
     obs,
     my_color: int,
+    win_reward: float = WIN_REWARD,
 ) -> float:
     """
     obs: 종료 시점 obs
     my_color: 학습 중인 에이전트의 색 (0=흑,1=백)
+
+    이기면 +win_reward, 지면 -win_reward, 동점이면 0
     """
     me, opp, obstacles, _ = split_me_opp(obs, my_color)
     my_alive  = int((me[:, 2] > 0.5).sum())
     opp_alive = int((opp[:, 2] > 0.5).sum())
 
     if my_alive > opp_alive:
-        return 1.0
+        return win_reward
     elif my_alive < opp_alive:
-        return -1.0
+        return -win_reward
     else:
         return 0.0
+
+
+def compute_alive_potential(
+    obs,
+    my_color: int,
+    alpha: float = ALIVE_ALPHA,
+    beta: float = ALIVE_BETA,
+) -> float:
+    """
+    Φ_alive(s) = α * (my_alive - opp_alive) - β * (my_alive + opp_alive)
+    """
+    me, opp, _, _ = split_me_opp(obs, my_color)
+    my_alive  = float((me[:, 2] > 0.5).sum())
+    opp_alive = float((opp[:, 2] > 0.5).sum())
+
+    alive_diff  = my_alive - opp_alive
+    total_alive = my_alive + opp_alive
+
+    return alpha * alive_diff - beta * total_alive
+
+
+def compute_pos_potential(
+    obs,
+    my_color: int,
+    board_w: float = BOARD_W,
+    board_h: float = BOARD_H,
+    gamma_d: float = POS_GAMMA_D,
+) -> float:
+    """
+    Ψ_pos(s) = -γ_d * min_my_op_dist(s)
+    (내 돌과 상대 돌 간 최소 거리 기반 포지션 잠재함수)
+    """
+    me, opp, _, _ = split_me_opp(obs, my_color)
+    me_norm  = normalize_stones(me,  board_w, board_h)
+    opp_norm = normalize_stones(opp, board_w, board_h)
+
+    min_d = min_pairwise_dist(me_norm, opp_norm)
+    return -gamma_d * float(min_d)
+
+
+def compute_shaping_rewards(
+    prev_obs,
+    curr_obs,
+    my_color: int,
+    gamma: float = GAMMA,
+) -> tuple[float, float]:
+    """
+    s=prev_obs, s'=curr_obs 에 대해
+      r_alive = γ Φ_alive(s') - Φ_alive(s)
+      r_pos   = γ Ψ_pos(s')   - Ψ_pos(s)
+    를 계산해서 반환.
+    """
+    phi_prev = compute_alive_potential(prev_obs, my_color)
+    phi_curr = compute_alive_potential(curr_obs, my_color)
+
+    psi_prev = compute_pos_potential(prev_obs, my_color)
+    psi_curr = compute_pos_potential(curr_obs, my_color)
+
+    r_alive = gamma * phi_curr - phi_prev
+    r_pos   = gamma * psi_curr - psi_prev
+    return r_alive, r_pos
 
 
 # ============================================================
@@ -329,7 +411,6 @@ def decode_action_index(action_idx: int):
     angle_step = 360.0 / N_ANGLES
     angle = -180.0 + angle_id * angle_step
 
-    # 여기 수정
     power_min, power_max = 500.0, 2500.0  # 예: 500 이상만 허용
     if N_POWERS == 1:
         power = (power_min + power_max) / 2.0
@@ -337,7 +418,6 @@ def decode_action_index(action_idx: int):
         power = power_min + (power_id / (N_POWERS - 1)) * (power_max - power_min)
 
     return stone_id, angle, power
-
 
 
 def idx_to_action(action_idx: int, obs) -> Dict[str, Any]:
@@ -482,7 +562,7 @@ def compute_gae(
     rewards: torch.Tensor,
     dones: torch.Tensor,
     values: torch.Tensor,
-    gamma: float = 0.99,
+    gamma: float = GAMMA,
     lam: float = 0.95,
 ):
     T = rewards.size(0)
@@ -513,7 +593,7 @@ def ppo_update(
     device: torch.device,
     epochs: int = 4,
     batch_size: int = 64,
-    gamma: float = 0.99,
+    gamma: float = GAMMA,
     lam: float = 0.95,
     clip_coef: float = 0.2,
     vf_coef: float = 0.5,
@@ -574,20 +654,21 @@ def ppo_update(
 
 # ============================================================
 # 6. Self-play 훈련 루프
-#    - 하나의 PPO policy (model)
-#    - 상대는 opponent_model (frozen copy)
-#    - 에피소드마다 learner_color를 랜덤(0 or 1)으로 선택
 # ============================================================
 def train_selfplay_ppo(
     num_episodes: int = 5000,
     rollout_size: int = 2048,
     opponent_update_interval: int = 500,
-    save_interval_episodes: int = 10000,   # <-- 추가
+    save_interval_episodes: int = 10000,
 ):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print("Device:", device)
 
     env = make_env()
+
+    # 체크포인트 저장 폴더
+    ckpt_dir = "checkpoints"
+    os.makedirs(ckpt_dir, exist_ok=True)
 
     model = ActorCritic(STATE_DIM, N_ACTIONS).to(device)
     opponent_model = ActorCritic(STATE_DIM, N_ACTIONS).to(device)
@@ -599,6 +680,23 @@ def train_selfplay_ppo(
 
     global_step = 0
     update_count = 0
+
+    # ====== ★ 전역 평가 지표 누적용 변수들 ★ ======
+    total_episodes = 0
+    total_wins = 0
+    total_loses = 0
+    total_draws = 0
+    sum_alive_diff = 0.0
+
+    # ---- (1) 전역 액션 히스토그램 ----
+    global_action_counts = np.zeros(N_ACTIONS, dtype=np.int64)
+    global_action_total = 0
+
+    # ---- (2) stone / angle / power 마진 분포 ----
+    global_stone_counts = np.zeros(N_STONES, dtype=np.int64)
+    global_angle_counts = np.zeros(N_ANGLES, dtype=np.int64)
+    global_power_counts = np.zeros(N_POWERS, dtype=np.int64)
+    # ==========================================
 
     for ep in range(num_episodes):
         obs, info = env.reset()
@@ -615,15 +713,29 @@ def train_selfplay_ppo(
         ep_dones = []
         ep_is_learner = []
 
+        # 로그용 컴포넌트 누적
+        ep_alive_sum = 0.0
+        ep_pos_sum = 0.0
+        ep_env_sum = 0.0
+
+        # learner 턴 관련 로그용
+        learner_actions = []
+        learner_entropy_sum = 0.0
+        learner_entropy_steps = 0
+
         while not done:
             turn_color = int(obs["turn"])
 
+            # learner 관점 state 인코딩 (항상 learner_color 기준)
             state_np_learner = encode_state_fe_alkkagi(
                 obs, learner_color, BOARD_W, BOARD_H
             )
             state_t_learner = torch.from_numpy(state_np_learner).float().to(device)
 
             if turn_color == learner_color:
+                # ================= learner 턴 =================
+                prev_obs = obs  # shaping용 이전 상태
+
                 model.train()
                 action_t, logprob_t, value_t = model.act(
                     state_t_learner, deterministic=False
@@ -631,31 +743,83 @@ def train_selfplay_ppo(
                 action_idx = int(action_t.item())
                 env_action = idx_to_action(action_idx, obs)
 
+                # ---- (1)(2) 전역 액션 통계: learner 턴에서만 업데이트 ----
+                global_action_counts[action_idx] += 1
+                global_action_total += 1
+
+                stone_id = action_idx // (N_ANGLES * N_POWERS)
+                rem = action_idx % (N_ANGLES * N_POWERS)
+                angle_id = rem // N_POWERS
+                power_id = rem % N_POWERS
+
+                global_stone_counts[stone_id] += 1
+                global_angle_counts[angle_id] += 1
+                global_power_counts[power_id] += 1
+                # -------------------------------------------------------
+
                 next_obs, _, terminated, truncated, info = env.step(env_action)
                 done = terminated or truncated
 
+                # --- reward shaping ---
+                r_alive, r_pos = compute_shaping_rewards(
+                    prev_obs,
+                    next_obs,
+                    my_color=learner_color,
+                    gamma=GAMMA,
+                )
+                shaping_reward = ALIVE_LAMBDA * r_alive + POS_LAMBDA * r_pos
+                step_reward = shaping_reward
+
+                ep_alive_sum += ALIVE_LAMBDA * r_alive
+                ep_pos_sum += POS_LAMBDA * r_pos
+
+                # --- terminal win/lose reward ---
+                if done:
+                    r_env = compute_win_loss_reward(
+                        next_obs,
+                        learner_color,
+                        win_reward=WIN_REWARD,
+                    )
+                    step_reward += r_env
+                    ep_env_sum += r_env
+
+                # ----- 정책 엔트로피 & 액션 로그 -----
+                with torch.no_grad():
+                    logits_ent, _ = model.forward(state_t_learner.unsqueeze(0))
+                    dist_ent = torch.distributions.Categorical(logits=logits_ent)
+                    entropy_step = dist_ent.entropy().mean().item()
+                learner_entropy_sum += entropy_step
+                learner_entropy_steps += 1
+                learner_actions.append(action_idx)
+                # -----------------------------------
+
+                # rollout 저장
                 ep_states.append(state_np_learner)
                 ep_actions.append(action_idx)
                 ep_logprobs.append(float(logprob_t.item()))
                 ep_values.append(float(value_t.item()))
-                ep_rewards.append(0.0)
-                ep_dones.append(False)
+                ep_rewards.append(float(step_reward))
+                ep_dones.append(bool(done))
                 ep_is_learner.append(True)
 
                 obs = next_obs
 
             else:
+                # ================= opponent 턴 =================
+                # learner 관점 value만 뽑아서 trajectory에 넣음
                 with torch.no_grad():
                     value_t = model.forward(state_t_learner)[1]
 
+                # 이 스텝의 state(learner 관점)를 먼저 저장
                 ep_states.append(state_np_learner)
-                ep_actions.append(0)
-                ep_logprobs.append(0.0)
+                ep_actions.append(0)           # dummy
+                ep_logprobs.append(0.0)        # dummy
                 ep_values.append(float(value_t.item()))
-                ep_rewards.append(0.0)
-                ep_dones.append(False)
                 ep_is_learner.append(False)
 
+                prev_obs = obs  # opponent 액션 이전 상태
+
+                # opponent state 인코딩 후 액션
                 state_np_opp = encode_state_fe_alkkagi(
                     obs, opponent_color, BOARD_W, BOARD_H
                 )
@@ -671,11 +835,37 @@ def train_selfplay_ppo(
 
                 next_obs, _, terminated, truncated, info = env.step(env_action_opp)
                 done = terminated or truncated
+
+                # --- reward shaping (여전히 learner 관점) ---
+                r_alive, r_pos = compute_shaping_rewards(
+                    prev_obs,
+                    next_obs,
+                    my_color=learner_color,
+                    gamma=GAMMA,
+                )
+                shaping_reward = ALIVE_LAMBDA * r_alive + POS_LAMBDA * r_pos
+                step_reward = shaping_reward
+
+                ep_alive_sum += ALIVE_LAMBDA * r_alive
+                ep_pos_sum += POS_LAMBDA * r_pos
+
+                if done:
+                    r_env = compute_win_loss_reward(
+                        next_obs,
+                        learner_color,
+                        win_reward=WIN_REWARD,
+                    )
+                    step_reward += r_env
+                    ep_env_sum += r_env
+
+                ep_rewards.append(float(step_reward))
+                ep_dones.append(bool(done))
+
                 obs = next_obs
 
+        # ===== 에피소드 종료 후: 버퍼 적재 =====
         if len(ep_states) > 0:
-            final_reward = compute_win_loss_reward(obs, learner_color)
-            ep_rewards[-1] = final_reward
+            # 안전빵: 마지막 done이 혹시 False로 남아있으면 True로 강제
             ep_dones[-1] = True
 
             for s, a, lp, v, r, d, is_l in zip(
@@ -693,6 +883,40 @@ def train_selfplay_ppo(
                 )
                 global_step += 1
 
+        # ===== 전역 평가 지표 업데이트 =====
+        total_episodes += 1
+
+        # 승/패/무
+        if ep_env_sum > 0:
+            total_wins += 1
+        elif ep_env_sum < 0:
+            total_loses += 1
+        else:
+            total_draws += 1
+
+        win_rate = total_wins / max(1, total_episodes)
+
+        # 최종 alive 차이
+        me_final, opp_final, _, _ = split_me_opp(obs, learner_color)
+        my_alive_final  = int((me_final[:, 2] > 0.5).sum())
+        opp_alive_final = int((opp_final[:, 2] > 0.5).sum())
+        alive_diff = my_alive_final - opp_alive_final  # -3 ~ +3
+
+        sum_alive_diff += alive_diff
+        avg_alive_diff = sum_alive_diff / max(1, total_episodes)
+
+        # 에피소드 길이
+        ep_len = len(ep_states)
+
+        # 정책 엔트로피 / 액션 다양성
+        if learner_entropy_steps > 0:
+            entropy_mean = learner_entropy_sum / learner_entropy_steps
+        else:
+            entropy_mean = 0.0
+
+        uniq_learner_actions = len(set(learner_actions)) if learner_actions else 0
+
+        # ===== PPO 업데이트 =====
         if len(buffer) >= rollout_size:
             ppo_update(
                 model=model,
@@ -701,7 +925,7 @@ def train_selfplay_ppo(
                 device=device,
                 epochs=4,
                 batch_size=64,
-                gamma=0.99,
+                gamma=GAMMA,
                 lam=0.95,
                 clip_coef=0.2,
                 vf_coef=0.5,
@@ -715,34 +939,71 @@ def train_selfplay_ppo(
                 opponent_model.load_state_dict(model.state_dict())
 
         ep_return = sum(ep_rewards) if len(ep_rewards) > 0 else 0.0
+
+        # === 전역 액션 분포 기반 지표 계산 ===
+        if global_action_total > 0:
+            p = global_action_counts / global_action_total
+            p_nonzero = p[p > 0]
+            H = -np.sum(p_nonzero * np.log(p_nonzero))
+            eff_act = float(np.exp(H))              # 유효 액션 개수
+            top1 = float(p.max())
+            top5 = float(np.sort(p)[-5:].sum())
+
+            stone_mode = int(np.argmax(global_stone_counts))
+            angle_mode = int(np.argmax(global_angle_counts))
+            power_mode = int(np.argmax(global_power_counts))
+
+            stone_mode_p = global_stone_counts[stone_mode] / global_action_total
+            angle_mode_p = global_angle_counts[angle_mode] / global_action_total
+            power_mode_p = global_power_counts[power_mode] / global_action_total
+        else:
+            eff_act = 0.0
+            top1 = 0.0
+            top5 = 0.0
+            stone_mode = angle_mode = power_mode = -1
+            stone_mode_p = angle_mode_p = power_mode_p = 0.0
+
+        # ===== 로그 출력 =====
         if (ep + 1) % 100 == 0:
             print(
-                f"[Ep {ep+1:05d}] learner_color={learner_color}, "
-                f"ep_steps={len(ep_states)}, ep_return={ep_return:.2f}, "
+                f"[Ep {ep+1:05d}] "
+                f"color={learner_color}, "
+                f"W/L/D={total_wins}/{total_loses}/{total_draws} "
+                f"(win_rate={win_rate:.3f}), "
+                f"ep_len={ep_len:3d}, "
+                f"alive_diff={alive_diff:+d} (avg={avg_alive_diff:+.2f}), "
+                f"entropy={entropy_mean:.3f}, "
+                f"uniq_act={uniq_learner_actions:3d}, "
+                f"ret_total={ep_return:7.2f}, "
+                f"ret_env={ep_env_sum:7.2f}, "
+                f"ret_alive={ep_alive_sum:7.2f}, "
+                f"ret_pos={ep_pos_sum:7.2f}, "
+                f"eff_act={eff_act:6.1f}, "
+                f"top1={top1:.3f}, top5={top5:.3f}, "
+                f"stone_mode={stone_mode}({stone_mode_p:.2f}), "
+                f"angle_mode={angle_mode}({angle_mode_p:.2f}), "
+                f"power_mode={power_mode}({power_mode_p:.2f}), "
                 f"buffer_len={len(buffer)}"
             )
 
-        # =============== ★ 추가된 부분 ★ ===============
+        # =============== ★ 체크포인트 저장 ★ ===============
         if (ep + 1) % save_interval_episodes == 0:
-            ckpt_path = f"alkkagi_ppo_ep_{ep+1}.pt"
+            ckpt_path = os.path.join(ckpt_dir, f"alkkagi_ppo_ep_{ep+1}.pt")
             torch.save(model.state_dict(), ckpt_path)
             print(f"[Checkpoint] Saved model to {ckpt_path}")
-        # ===============================================
+        # ===================================================
 
     env.close()
 
     # 마지막 저장
-    torch.save(model.state_dict(), "alkkagi_ppo_final.pt")
-    print("Training finished. Saved final model to alkkagi_ppo_final.pt")
+    final_ckpt_path = os.path.join(ckpt_dir, "alkkagi_ppo_final.pt")
+    torch.save(model.state_dict(), final_ckpt_path)
+    print(f"Training finished. Saved final model to {final_ckpt_path}")
 
 
 # ============================================================
 # 7. 제출용 Agent 래퍼 (YourBlackAgent / YourWhiteAgent)
-#    - evalute.py: from agent import YourBlackAgent, YourWhiteAgent
-#    - black = YourBlackAgent.load(ckpt_path)
-#      white = YourWhiteAgent.load(ckpt_path)
 # ============================================================
-
 # kym.Agent가 없을 경우를 위한 fallback
 try:
     BaseAgent = kym.Agent
@@ -796,6 +1057,7 @@ class BaseAlkkagiAgent(BaseAgent):
         env_action = idx_to_action(action_idx, obs)
         return env_action
 
+
 class YourBlackAgent(BaseAlkkagiAgent):
     def __init__(self, ckpt_path: str | None = None, device=None):
         super().__init__(color=0, ckpt_path=ckpt_path, device=device)
@@ -807,6 +1069,7 @@ class YourBlackAgent(BaseAlkkagiAgent):
           black = YourBlackAgent.load(black_ckpt)
         """
         return cls(ckpt_path=ckpt_path, device=device)
+
     def save(self, ckpt_path: str):
         """
         kym.Agent의 abstract method 구현.
@@ -835,13 +1098,10 @@ class YourWhiteAgent(BaseAlkkagiAgent):
         torch.save(self.model.state_dict(), ckpt_path)
 
 
-
-
-
 if __name__ == "__main__":
     train_selfplay_ppo(
         num_episodes=100000000,
         rollout_size=2048,
         opponent_update_interval=10,
-        save_interval_episodes=10000,   # ← 명시적으로 넣기
+        save_interval_episodes=10000,
     )

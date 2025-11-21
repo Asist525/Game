@@ -4,8 +4,8 @@ import kymnasium as kym
 from agent import YourBlackAgent, YourWhiteAgent
 
 # checkpoint paths
-black_ckpt = r"/home/ubuntu/alkhagi/Game/alkkagi_ppo_selfplay.pt"
-white_ckpt = r"/home/ubuntu/alkhagi/Game/alkkagi_ppo_selfplay.pt"
+black_ckpt = "/home/ubuntu/alkhagi/Game/alkkagi_ppo_ep_40000.pt"
+white_ckpt = "/home/ubuntu/alkhagi/Game/alkkagi_ppo_ep_40000.pt"
 
 black = YourBlackAgent.load(black_ckpt)
 white = YourWhiteAgent.load(white_ckpt)

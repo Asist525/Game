@@ -1,153 +1,286 @@
-import gymnasium as gym
+# test.py
+import os
 import numpy as np
 import torch
-import matplotlib.pyplot as plt
-from torch.nn.functional import softmax
 
 from agent import (
-    encode_state_fe_alkkagi, ActorCritic, idx_to_action,
-    BOARD_W, BOARD_H, STATE_DIM,
-    N_STONES, N_ANGLES, N_POWERS, N_ACTIONS
+    make_env,
+    ActorCritic,
+    encode_state_fe_alkkagi,
+    idx_to_action,
+    STATE_DIM,
+    N_ACTIONS,
+    BOARD_W,
+    BOARD_H,
+    compute_shaping_rewards,
+    compute_win_loss_reward,
+    GAMMA,
+    WIN_REWARD,
+    ALIVE_LAMBDA,
+    POS_LAMBDA,
 )
 
 
-# -----------------------------
-# Utils for full policy analysis
-# -----------------------------
-def decode_triplet(action_idx, N_STONES, N_ANGLES, N_POWERS):
-    stone_id = action_idx // (N_ANGLES * N_POWERS)
-    rem = action_idx % (N_ANGLES * N_POWERS)
-    angle_id = rem // N_POWERS
-    power_id = rem % N_POWERS
-    return stone_id, angle_id, power_id
-
-
-def build_table_from_logits(logits):
-    """logits → stone x angle x power 3D 테이블"""
-    probs = torch.softmax(logits, dim=-1).cpu().numpy()
-    table = np.zeros((N_STONES, N_ANGLES, N_POWERS), dtype=np.float32)
-
-    for idx, p in enumerate(probs):
-        s, a, pw = decode_triplet(idx, N_STONES, N_ANGLES, N_POWERS)
-        table[s, a, pw] = p
-
-    return table
-
-
-def print_axis_preferences(table):
-    stone_pref = table.sum(axis=(1, 2))
-    angle_pref = table.sum(axis=(0, 2))
-    power_pref = table.sum(axis=(0, 1))
-
-    print("\n[Stone preference]", stone_pref)
-    print("[Angle preference]", angle_pref)
-    print("[Power preference]", power_pref)
-
-
-def plot_angle_power_heatmap(table, stone_id=None, title_prefix=""):
-    if stone_id is None:
-        mat = table.sum(axis=0)
-        title = f"{title_prefix} Heatmap (ALL Stones)"
-    else:
-        mat = table[stone_id]
-        title = f"{title_prefix} Heatmap (Stone {stone_id})"
-
-    plt.figure(figsize=(6, 5))
-    plt.imshow(mat, cmap='hot', interpolation='nearest')
-    plt.colorbar()
-    plt.title(title)
-    plt.xlabel("Power ID")
-    plt.ylabel("Angle ID")
-    plt.tight_layout()
-    plt.show()
-
-
-# -----------------------------
-#   FULL VERIFY FUNCTION
-# -----------------------------
-def verify_policy_full(model_path: str, steps: int = 20, analyze_every: int = 1):
+def make_model(ckpt_path: str | None = None):
     """
-    analyze_every: STEP마다 분석하면 1, 5로 하면 5스텝마다 분석 출력
+    ckpt_path가 주어지고 실제로 존재하면 로드,
+    아니면 랜덤 초기화된 ActorCritic을 반환.
     """
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print("Using device:", device)
+    model = ActorCritic(STATE_DIM, N_ACTIONS).to(device)
 
-    model = ActorCritic(state_dim=STATE_DIM, n_actions=N_ACTIONS).to(device)
-    model.load_state_dict(torch.load(model_path, map_location=device))
+    if ckpt_path is not None and os.path.exists(ckpt_path):
+        print(f"[make_model] Loading checkpoint from {ckpt_path}")
+        state_dict = torch.load(ckpt_path, map_location=device)
+        model.load_state_dict(state_dict)
+    else:
+        print("[make_model] No checkpoint. Using randomly initialized model.")
+
     model.eval()
+    return model, device
 
-    env = gym.make(
-        "kymnasium/AlKkaGi-3x3-v0",
-        obs_type="custom",
-        render_mode=None,
-        bgm=False,
-    )
 
-    obs, info = env.reset()
-    my_color = 0
+def check_reward_scale(
+    model,
+    device,
+    num_episodes: int = 10,
+    max_steps_per_ep: int = 200,
+):
+    """
+    self-play 비슷하게 돌리면서,
+    에피소드별로
+      - ret_total : 전체 리턴
+      - ret_env   : 승/패 보상 합 (±WIN_REWARD)
+      - ret_alive : λ_alive * r_alive 합
+      - ret_pos   : λ_pos   * r_pos   합
+    을 출력해서, shaping이 승/패 보상을 먹고 있는지 스케일 확인.
+    """
 
-    print("\n==== FULL POLICY TEST START ====\n")
+    import numpy as np  # np.random 쓰려고
 
-    for t in range(steps):
-        print(f"\n================")
-        print(f"----- STEP {t} -----")
+    env = make_env()
 
-        # -------- Encode state -----------
-        state_np = encode_state_fe_alkkagi(obs, my_color, BOARD_W, BOARD_H)
-        state_t = torch.from_numpy(state_np).float().to(device)
+    for ep in range(num_episodes):
+        obs, info = env.reset()
+        done = False
+        steps = 0
 
-        # -------- Forward pass ------------
-        with torch.no_grad():
-            logits, value = model(state_t.unsqueeze(0))
-            logits = logits.squeeze(0)
+        # 학습 코드랑 맞추기 위해 매 에피소드 learner_color 랜덤
+        learner_color = np.random.randint(0, 2)
+        opponent_color = 1 - learner_color
 
-        probs = softmax(logits, dim=-1)
+        ep_total_return = 0.0
+        ep_env_sum = 0.0
+        ep_alive_sum = 0.0
+        ep_pos_sum = 0.0
 
-        # -------- Basic info print --------
-        argmax_idx = int(torch.argmax(probs).item())
-        argmax_prob = float(probs[argmax_idx].item())
-        dist = torch.distributions.Categorical(logits=logits)
-        sampled_idx = int(dist.sample().item())
+        while not done and steps < max_steps_per_ep:
+            steps += 1
+            turn_color = int(obs["turn"])
 
-        print(f"[Value] {value.item():.4f}")
-        print(f"[Argmax] idx={argmax_idx}, prob={argmax_prob:.4f}")
-        print(f"[Sample] idx={sampled_idx}")
+            # learner 관점 state
+            state_np_learner = encode_state_fe_alkkagi(
+                obs, learner_color, BOARD_W, BOARD_H
+            )
+            state_t_learner = torch.from_numpy(state_np_learner).float().to(device)
 
-        topk = torch.topk(probs, 5)
-        print("Top-5 idx:", topk.indices.tolist())
-        print("Top-5 prob:", [float(p) for p in topk.values.tolist()])
+            # ------------------------------------------------
+            # learner 턴
+            # ------------------------------------------------
+            if turn_color == learner_color:
+                prev_obs = obs
 
-        # -------- FULL DISTRIBUTION ANALYSIS --------
-        if t % analyze_every == 0:
-            print("\n=== FULL ACTION DISTRIBUTION ANALYSIS ===")
+                with torch.no_grad():
+                    logits, _ = model(state_t_learner.unsqueeze(0))
+                    probs = torch.softmax(logits, dim=-1)[0].cpu().numpy()
 
-            # build 3D table (stone × angle × power)
-            table = build_table_from_logits(logits)
+                # deterministic 평가 (그리디)
+                action_idx = int(probs.argmax())
+                env_action = idx_to_action(action_idx, obs)
 
-            # axis-wise preferences
-            print_axis_preferences(table)
+                obs, _, terminated, truncated, info = env.step(env_action)
+                done = terminated or truncated
 
-            # heatmap (ALL stones)
-            plot_angle_power_heatmap(table, None, f"STEP {t}")
+                # shaping (alive / pos)
+                r_alive, r_pos = compute_shaping_rewards(
+                    prev_obs,
+                    obs,
+                    my_color=learner_color,
+                    gamma=GAMMA,
+                )
+                alive_contrib = ALIVE_LAMBDA * r_alive
+                pos_contrib = POS_LAMBDA * r_pos
+                step_reward = alive_contrib + pos_contrib
 
-            # per-stone heatmap
-            for s in range(N_STONES):
-                plot_angle_power_heatmap(table, s, f"STEP {t}")
+                ep_alive_sum += alive_contrib
+                ep_pos_sum += pos_contrib
 
-        # -------- environment step --------
-        action_dict = idx_to_action(sampled_idx, obs)
-        obs, _, terminated, truncated, info = env.step(action_dict)
+                # 끝났으면 env 승/패 보상 추가
+                if done:
+                    r_env = compute_win_loss_reward(
+                        obs,
+                        my_color=learner_color,
+                        win_reward=WIN_REWARD,
+                    )
+                    step_reward += r_env
+                    ep_env_sum += r_env
 
-        if terminated or truncated:
-            print("Episode ended -> reset.")
-            obs, info = env.reset()
+                ep_total_return += step_reward
+
+            # ------------------------------------------------
+            # opponent 턴 (같은 model로 self-play)
+            # ------------------------------------------------
+            else:
+                prev_obs = obs
+
+                # opponent 관점 state
+                state_np_opp = encode_state_fe_alkkagi(
+                    obs, opponent_color, BOARD_W, BOARD_H
+                )
+                state_opp_t = torch.from_numpy(state_np_opp).float().to(device)
+
+                with torch.no_grad():
+                    logits_opp, _ = model(state_opp_t.unsqueeze(0))
+                    probs_opp = torch.softmax(logits_opp, dim=-1)[0].cpu().numpy()
+
+                action_idx_opp = int(probs_opp.argmax())
+                env_action_opp = idx_to_action(action_idx_opp, obs)
+
+                obs, _, terminated, truncated, info = env.step(env_action_opp)
+                done = terminated or truncated
+
+                # reward는 여전히 learner 관점에서 계산
+                r_alive, r_pos = compute_shaping_rewards(
+                    prev_obs,
+                    obs,
+                    my_color=learner_color,
+                    gamma=GAMMA,
+                )
+                alive_contrib = ALIVE_LAMBDA * r_alive
+                pos_contrib = POS_LAMBDA * r_pos
+                step_reward = alive_contrib + pos_contrib
+
+                ep_alive_sum += alive_contrib
+                ep_pos_sum += pos_contrib
+
+                if done:
+                    r_env = compute_win_loss_reward(
+                        obs,
+                        my_color=learner_color,
+                        win_reward=WIN_REWARD,
+                    )
+                    step_reward += r_env
+                    ep_env_sum += r_env
+
+                ep_total_return += step_reward
+
+        print(
+            f"[Scale Ep {ep+1:03d}] "
+            f"steps={steps:3d}, "
+            f"ret_total={ep_total_return:7.2f}, "
+            f"ret_env={ep_env_sum:7.2f}, "
+            f"ret_alive={ep_alive_sum:7.2f}, "
+            f"ret_pos={ep_pos_sum:7.2f}"
+        )
 
     env.close()
-    print("\n==== FULL TEST END ====\n")
 
 
-# -----------------------------
-# Run
-# -----------------------------
+def check_action_distribution(
+    model,
+    device,
+    num_episodes: int = 30,
+    max_steps_per_ep: int = 200,
+    deterministic_eval: bool = True,
+):
+    """
+    학습된(또는 랜덤) policy로 self-play를 돌리면서
+    - 액션 히스토그램
+    - 평균 엔트로피
+    를 찍어서 collapse 여부 감.
+
+    여기서는 흑/백 모두 같은 모델을 사용.
+    """
+
+    env = make_env()
+
+    action_counts = np.zeros(N_ACTIONS, dtype=np.int64)
+    entropies = []
+
+    for ep in range(num_episodes):
+        obs, info = env.reset()
+        done = False
+        steps = 0
+
+        while not done and steps < max_steps_per_ep:
+            steps += 1
+
+            my_color = int(obs["turn"])
+            state_np = encode_state_fe_alkkagi(
+                obs, my_color, BOARD_W, BOARD_H
+            )
+            state_t = torch.from_numpy(state_np).float().to(device)
+
+            with torch.no_grad():
+                logits, _ = model(state_t.unsqueeze(0))
+                probs = torch.softmax(logits, dim=-1)[0].cpu().numpy()
+
+            # 엔트로피 (stochastic 기준)
+            entropy = -(probs * np.log(probs + 1e-8)).sum()
+            entropies.append(entropy)
+
+            if deterministic_eval:
+                action_idx = int(probs.argmax())
+            else:
+                action_idx = int(np.random.choice(N_ACTIONS, p=probs))
+
+            action_counts[action_idx] += 1
+
+            env_action = idx_to_action(action_idx, obs)
+            obs, reward, terminated, truncated, info = env.step(env_action)
+            done = terminated or truncated
+
+    env.close()
+
+    total_actions = action_counts.sum()
+    print("\n==== Action Distribution Debug ====")
+    print(f"episodes      : {num_episodes}")
+    print(f"total actions : {total_actions}")
+    print(f"mean entropy  : {np.mean(entropies):.4f}")
+    print(f"min entropy   : {np.min(entropies):.4f}")
+    print(f"max entropy   : {np.max(entropies):.4f}")
+
+    top_k = 10
+    top_indices = np.argsort(-action_counts)[:top_k]
+    print(f"\nTop {top_k} actions by freq:")
+    for idx in top_indices:
+        freq = action_counts[idx]
+        if freq == 0:
+            continue
+        ratio = freq / total_actions
+        print(f"  action {idx:4d}: count={freq:6d}, ratio={ratio*100:5.2f}%")
+
+
 if __name__ == "__main__":
-    verify_policy_full("alkkagi_ppo_selfplay.pt", steps=30, analyze_every=1)
+    # ✅ ckpt 없는 환경 가정 → None
+    # 나중에 있으면 경로 넣고 돌리면 됨.
+    CKPT_PATH = None
+
+    model, device = make_model(CKPT_PATH)
+
+    print("=== 1) Reward scale check (env vs shaping) ===")
+    check_reward_scale(
+        model=model,
+        device=device,
+        num_episodes=5,      # 필요하면 늘리기
+        max_steps_per_ep=200,
+    )
+
+    print("\n=== 2) Action distribution / entropy (collapse 여부) ===")
+    check_action_distribution(
+        model=model,
+        device=device,
+        num_episodes=10,
+        max_steps_per_ep=200,
+        deterministic_eval=True,
+    )

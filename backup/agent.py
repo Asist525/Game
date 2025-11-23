@@ -1314,7 +1314,7 @@ def main_train():
         snapshot_interval=20,
         config=config,
         checkpoint_dir="checkpoints",
-        checkpoint_interval=200,
+        checkpoint_interval=100,
         max_checkpoints=20,
         log_path="training_metrics.csv",
     )

@@ -1005,6 +1005,7 @@ def train_league_selfplay(
     checkpoint_interval: int = 5000,
     max_checkpoints: int = 20,
     log_path: str = "training_metrics_v3.csv",
+    max_players: int = 50, 
 ) -> tuple[PPOPolicy, EloLeague]:
 
     """
@@ -1251,10 +1252,33 @@ def train_league_selfplay(
             snap_policy = clone_policy(learner)
             snap_id = f"snap_{snapshot_counter:03d}"
             snapshot_counter += 1
+
+            # 새 snapshot 추가
             league.players.append(
-                RatedPolicy(id=snap_id, policy=snap_policy,
-                            rating=learner_rating, games=0)
+                RatedPolicy(
+                    id=snap_id,
+                    policy=snap_policy,
+                    rating=learner_rating,
+                    games=0,
+                )
             )
+
+            # ★ max_players=50 유지: learner를 제외한 가장 오래된 snapshot부터 삭제
+            while len(league.players) > max_players:
+                # learner는 항상 남겨두고, 제일 앞에서부터 learner가 아닌 놈을 제거
+                remove_idx = None
+                for i, p in enumerate(league.players):
+                    if p.id != "learner":
+                        remove_idx = i
+                        break
+
+                # 이론상 항상 찾지만, 방어적으로 체크
+                if remove_idx is not None:
+                    del league.players[remove_idx]
+                else:
+                    # 혹시나 learner 하나만 남은 상태에서 꼬이면 루프 탈출
+                    break
+
 
     env.close()
     return learner, league
@@ -1324,23 +1348,24 @@ def main_train():
         gamma=0.99,
         gae_lambda=0.95,
         clip_coef=0.2,
-        ent_coef=0.01,
+        ent_coef=0.005,
         vf_coef=0.5,
         max_grad_norm=0.5,
-        learning_rate=3e-5,
+        learning_rate=1e-4,
         update_epochs=3,     
         batch_size=64,
     )
 
     learner, league = train_league_selfplay(
-        num_epochs=100000000,
-        episodes_per_epoch=50,
+        num_epochs=100000000, # 100000000
+        episodes_per_epoch=50, # 50
         snapshot_interval=5,
         config=config,
         checkpoint_dir="checkpoints_v3",
         checkpoint_interval=10,
         max_checkpoints=20,
         log_path="training_metrics_v3.csv",
+        max_players=50,
     )
 
     # 최종 learner 정책 저장

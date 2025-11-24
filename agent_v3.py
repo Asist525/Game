@@ -626,8 +626,8 @@ class PPOPolicy:
         self,
         observation: dict,
         my_color: int,
-        greedy: bool = True,
-        temperature: float = 1.2,
+        greedy: bool = False,
+        temperature: float = 1,
     ) -> dict:
         """
         평가용 act.

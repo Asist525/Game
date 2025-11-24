@@ -23,13 +23,13 @@ BOARD_W = 600
 BOARD_H = 600
 
 # --- 액션 디스크리타이제이션 ---
-N_ANGLES = 24   # 각도 24칸 (15도 step)
-N_POWERS = 6    # 파워 6단계
+N_ANGLES = 16  
+N_POWERS = 3   
 N_ACTIONS = N_STONES * N_ANGLES * N_POWERS  # 전체 디스크리트 액션 수
 
 # --- 리워드/셰이핑 관련 ---
-STEP_PENALTY = 0.01       # 턴당 -0.01 (너무 길게 끄는 걸 약하게 억제)
-POTENTIAL_ALPHA = 0.5      # potential Φ(s) = POTENTIAL_ALPHA * alive_diff(s)
+STEP_PENALTY = 0.005       # 턴당 -0.005 (너무 길게 끄는 걸 약하게 억제)
+POTENTIAL_ALPHA = 0.25      # potential Φ(s) = POTENTIAL_ALPHA * alive_diff(s)
 
 
 # ------------------------------------------------
@@ -1303,12 +1303,12 @@ def main_train():
         gamma=0.99,
         gae_lambda=0.95,
         clip_coef=0.2,
-        ent_coef=0.2,
+        ent_coef=0.01,
         vf_coef=0.5,
         max_grad_norm=0.5,
-        learning_rate=1e-4,
-        update_epochs=6,     # 테스트/디버그 땐 작게, 진짜 학습할 땐 키우기
-        batch_size=1024,
+        learning_rate=3e-5,
+        update_epochs=3,     
+        batch_size=64,
     )
 
     learner, league = train_league_selfplay(

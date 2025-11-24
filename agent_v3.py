@@ -28,8 +28,9 @@ N_POWERS = 3
 N_ACTIONS = N_STONES * N_ANGLES * N_POWERS  # 전체 디스크리트 액션 수
 
 # --- 리워드/셰이핑 관련 ---
+# --- 리워드/셰이핑 관련 ---
 STEP_PENALTY = 0.005       # 턴당 -0.005 (너무 길게 끄는 걸 약하게 억제)
-POTENTIAL_ALPHA = 0.25      # potential Φ(s) = POTENTIAL_ALPHA * alive_diff(s)
+POTENTIAL_ALPHA = 0.25     # 위치 기반 potential Φ_geo(s) 스케일
 
 
 # ------------------------------------------------
@@ -520,10 +521,24 @@ def compute_alive_diff(obs, my_color: int) -> float:
 
 def potential(obs, my_color: int) -> float:
     """
-    potential Φ(s) = POTENTIAL_ALPHA * alive_diff(s; my_color)
-    potential-based shaping: r' = r_true + γ Φ(s') - Φ(s)
+    위치 기반 형세 potential Φ_geo(s).
+
+    - 내 돌은 보드 중앙 쪽(엣지에서 멀게)
+    - 상대 돌은 보드 엣지 쪽(엣지에서 가깝게)
+
+    로 두고 싶다는 신호:
+      Φ_geo(s) = POTENTIAL_ALPHA * (my_min_edge - opp_min_edge)
     """
-    return POTENTIAL_ALPHA * compute_alive_diff(obs, my_color)
+    me, opp, obstacles, _ = split_me_opp(obs, my_color)
+    me_norm  = normalize_stones(me,  BOARD_W, BOARD_H)
+    opp_norm = normalize_stones(opp, BOARD_W, BOARD_H)
+
+    my_min_edge  = min_edge_dist(me_norm)
+    opp_min_edge = min_edge_dist(opp_norm)
+
+    geo = my_min_edge - opp_min_edge
+    return POTENTIAL_ALPHA * geo
+
 
 
 def compute_gae_returns(
@@ -1067,10 +1082,11 @@ def train_league_selfplay(
                 learner_turn = (turn == learner_color)
 
                 if learner_turn:
+                    # 위치 기반 potential: 현재 형세
                     phi_before = potential(obs, my_color=learner_color)
 
                     (action, action_idx, logprob,
-                     actor_state_vec, critic_state_vec) = learner.act_train(
+                    actor_state_vec, critic_state_vec) = learner.act_train(
                         observation=obs,
                         my_color=turn
                     )
@@ -1094,43 +1110,35 @@ def train_league_selfplay(
                 done = terminated or truncated
                 step += 1
 
-                # ===========================================================
-                #              Reward shaping + Debug (learner only)
-                # ===========================================================
+                # =============================
+                #   Reward shaping (learner)
+                # =============================
                 if learner_turn:
-                    base_reward = 0.0
-                    base_reward -= STEP_PENALTY
+                    # 시간 패널티
+                    base_reward = -STEP_PENALTY
 
-                    if terminated:
-                        base_reward += compute_alive_diff(obs_next, my_color=learner_color)
-
+                    # 위치 형세 potential: Φ_geo(s'), Φ_geo(s)
                     phi_after = potential(obs_next, my_color=learner_color)
+
+                    # potential-based shaping: r' = r_base + γ Φ(s') - Φ(s)
                     shaped_r = base_reward + config.gamma * phi_after - phi_before
-
-                    cumulative_reward = sum(ep_rewards) + shaped_r
-
-                    # # ---- 디버그 출력 ----
-                    # print("------ Reward Debug ------")
-                    # print(f"  φ(s)         = {phi_before:.4f}")
-                    # print(f"  φ(s')        = {phi_after:.4f}")
-                    # print(f"  step_penalty = {-STEP_PENALTY:.4f}")
-                    # print(f"  shaped_r     = {shaped_r:.4f}")
-                    # print(f"  total_reward = {cumulative_reward:.4f}")
-                    # print("--------------------------")
 
                     ep_rewards.append(shaped_r)
 
                 obs = obs_next
 
+
             # ===========================================================
             #               에피소드 종료 처리 (승패/ELO/GAE)
             # ===========================================================
-            R_learner = compute_alive_diff(obs, my_color=learner_color)
+            R_learner = compute_alive_diff(obs, my_color=learner_color)  # [-3, +3]
 
+            # 로그용 (평균 alive_diff)
             ep_reward_sum += R_learner
             ep_step_sum += step
             episodes_this_epoch += 1
 
+            # ELO용 스코어 (승/무/패)
             if R_learner > 0:
                 score_a = 1.0
                 ep_wins += 1
@@ -1143,9 +1151,23 @@ def train_league_selfplay(
 
             league.update_result("learner", opponent.id, score_a)
 
-            # opponent이 마지막에 마무리한 경우 → 최종 alive_diff 반영
-            if len(ep_rewards) > 0 and (not truncated) and (not last_step_by_learner):
-                ep_rewards[-1] += R_learner
+            # -----------------------------
+            #   최종 승패 보상(game_reward)
+            # -----------------------------
+            game_reward = 0.0
+            if not truncated:
+                # 단순 승/패 보상 (원하면 스케일 조정 가능)
+                if R_learner > 0:
+                    game_reward = 1.0
+                elif R_learner < 0:
+                    game_reward = -1.0
+                else:
+                    game_reward = 0.0  # 무승부
+
+                # 마지막 learner 스텝에 최종 보상 얹기
+                if len(ep_rewards) > 0:
+                    ep_rewards[-1] += game_reward
+
 
             # ---- GAE 계산 ----
             if len(ep_rewards) > 0:

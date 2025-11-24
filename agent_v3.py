@@ -28,7 +28,6 @@ N_POWERS = 3
 N_ACTIONS = N_STONES * N_ANGLES * N_POWERS  # 전체 디스크리트 액션 수
 
 # --- 리워드/셰이핑 관련 ---
-# --- 리워드/셰이핑 관련 ---
 STEP_PENALTY = 0.005       # 턴당 -0.005 (너무 길게 끄는 걸 약하게 억제)
 POTENTIAL_ALPHA = 0.25     # 위치 기반 potential Φ_geo(s) 스케일
 
@@ -1088,7 +1087,7 @@ def train_league_selfplay(
                     (action, action_idx, logprob,
                     actor_state_vec, critic_state_vec) = learner.act_train(
                         observation=obs,
-                        my_color=turn
+                        my_color=learner_color
                     )
 
                     ep_actor_states.append(actor_state_vec.cpu())

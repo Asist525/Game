@@ -1,0 +1,233 @@
+===========================1310episode====================================
+
+=========== EVAL SUMMARY (ALL EPISODES) ===========
+  num_episodes        : 50
+  total_steps         : 32240
+  avg steps/episode   : 644.80 # 지속적으로 느는지, 혹은 어느 순간부터 감소하는지 모니터링 대상(증가하면 캠핑, 감소하면 공격) 
+  total_reward_black  : 0.000 
+  total_reward_white  : 0.000
+  black_wins          : 31
+  white_wins          : 19
+  draws               : 0
+
+[EVAL] Average top-k probs over all steps (k=1..5)
+  avg top1 prob = 0.4713  (count=32240)
+  avg top2 prob = 0.0909  (count=32240)
+  avg top3 prob = 0.0545  (count=32240)
+  avg top4 prob = 0.0418  (count=32240)
+  avg top5 prob = 0.0333  (count=32240)
+
+* 뒤로갈수록 top1 확률이 올라갈테니 모니터링 대상
+
+[EVAL] avg policy entropy (all steps) = 2.1076
+* 1초반 ~ 0.xx 면 위험
+
+[EVAL] Mean action probs summary (over all steps):
+  n_actions      = 144
+  min(prob)      = 0.000000
+  max(prob)      = 0.236958 # 높을수록 수렴
+  mean(prob)     = 0.006944
+  std(prob)      = 0.022701  # 클수록 탐험이 큼
+
+  Top-10 actions by mean prob:
+    rank= 1, action_idx=   9, mean_prob=0.236958
+    rank= 2, action_idx=  66, mean_prob=0.096031
+    rank= 3, action_idx= 124, mean_prob=0.061871
+    rank= 4, action_idx=  99, mean_prob=0.043327
+    rank= 5, action_idx=  40, mean_prob=0.037948
+    rank= 6, action_idx= 123, mean_prob=0.036384
+    rank= 7, action_idx=  63, mean_prob=0.033049
+    rank= 8, action_idx=  30, mean_prob=0.027880
+    rank= 9, action_idx= 139, mean_prob=0.023896
+    rank=10, action_idx= 138, mean_prob=0.022780
+
+
+* 지속적으로 고정되는지, 아니면 수가 변하는지 역시 모니터링 대상
+
+
+
+===========================1470episode====================================
+
+=========== EVAL SUMMARY (ALL EPISODES) ===========
+  num_episodes        : 50
+  total_steps         : 20117
+  avg steps/episode   : 402.34
+  total_reward_black  : 0.000
+  total_reward_white  : 0.000
+  black_wins          : 20
+  white_wins          : 30
+  draws               : 0
+
+[EVAL] Average top-k probs over all steps (k=1..5)
+  avg top1 prob = 0.4564  (count=20117)
+  avg top2 prob = 0.1130  (count=20117)
+  avg top3 prob = 0.0646  (count=20117)
+  avg top4 prob = 0.0473  (count=20117)
+  avg top5 prob = 0.0367  (count=20117)
+
+[EVAL] avg policy entropy (all steps) = 2.1006
+
+[EVAL] Mean action probs summary (over all steps):
+  n_actions      = 144
+  min(prob)      = 0.000000
+  max(prob)      = 0.100994
+  mean(prob)     = 0.006944
+  std(prob)      = 0.016660
+
+  Top-10 actions by mean prob:
+    rank= 1, action_idx=  66, mean_prob=0.100994
+    rank= 2, action_idx=   9, mean_prob=0.088536
+    rank= 3, action_idx= 105, mean_prob=0.076916
+    rank= 4, action_idx=  99, mean_prob=0.065430
+    rank= 5, action_idx= 124, mean_prob=0.061533
+    rank= 6, action_idx= 109, mean_prob=0.061496
+    rank= 7, action_idx=  85, mean_prob=0.058097
+    rank= 8, action_idx=  40, mean_prob=0.047626
+    rank= 9, action_idx= 123, mean_prob=0.028055
+    rank=10, action_idx=  54, mean_prob=0.025086
+
+[EVAL] saved mean action probs to: eval_action_mean_probs.csv
+[EVAL] saved all step probs (flatten) to: eval_all_probs.npy
+       shape=(2896848,), min=0.000000, max=0.999995
+[EVAL] saved histogram plot to: eval_probs_hist.png
+[EVAL] saved rank plot to: eval_mean_rank_plot.png
+
+
+===========================1680episode====================================
+
+=========== EVAL SUMMARY (ALL EPISODES) ===========
+  num_episodes        : 50
+  total_steps         : 2136
+  avg steps/episode   : 42.72
+  total_reward_black  : 0.000
+  total_reward_white  : 0.000
+  black_wins          : 32
+  white_wins          : 18
+  draws               : 0
+
+[EVAL] Average top-k probs over all steps (k=1..5)
+  avg top1 prob = 0.7170  (count=2136)
+  avg top2 prob = 0.0731  (count=2136)
+  avg top3 prob = 0.0291  (count=2136)
+  avg top4 prob = 0.0192  (count=2136)
+  avg top5 prob = 0.0149  (count=2136)
+
+[EVAL] avg policy entropy (all steps) = 1.1404
+
+[EVAL] Mean action probs summary (over all steps):
+  n_actions      = 144
+  min(prob)      = 0.000001
+  max(prob)      = 0.157766
+  mean(prob)     = 0.006944
+  std(prob)      = 0.021426
+
+  Top-10 actions by mean prob:
+    rank= 1, action_idx= 109, mean_prob=0.157766
+    rank= 2, action_idx=  66, mean_prob=0.150947
+    rank= 3, action_idx=  85, mean_prob=0.090957
+    rank= 4, action_idx=   9, mean_prob=0.067057
+    rank= 5, action_idx= 124, mean_prob=0.065957
+    rank= 6, action_idx=  35, mean_prob=0.049902
+    rank= 7, action_idx=  53, mean_prob=0.030339
+    rank= 8, action_idx=  26, mean_prob=0.027376
+    rank= 9, action_idx=  48, mean_prob=0.026456
+    rank=10, action_idx=  91, mean_prob=0.025078
+
+[EVAL] saved mean action probs to: eval_action_mean_probs.csv
+[EVAL] saved all step probs (flatten) to: eval_all_probs.npy
+       shape=(307584,), min=0.000000, max=0.999996
+[EVAL] saved histogram plot to: eval_probs_hist.png
+[EVAL] saved rank plot to: eval_mean_rank_plot.png
+
+
+
+===========================2070episode====================================
+=========== EVAL SUMMARY (ALL EPISODES) ===========
+  num_episodes        : 50
+  total_steps         : 13578
+  avg steps/episode   : 271.56
+  total_reward_black  : 0.000
+  total_reward_white  : 0.000
+  black_wins          : 25
+  white_wins          : 25
+  draws               : 0
+
+[EVAL] Average top-k probs over all steps (k=1..5)
+  avg top1 prob = 0.4884  (count=13578)
+  avg top2 prob = 0.1147  (count=13578)
+  avg top3 prob = 0.0666  (count=13578)
+  avg top4 prob = 0.0452  (count=13578)
+  avg top5 prob = 0.0337  (count=13578)
+
+[EVAL] avg policy entropy (all steps) = 2.0030
+
+[EVAL] Mean action probs summary (over all steps):
+  n_actions      = 144
+  min(prob)      = 0.000001
+  max(prob)      = 0.103544
+  mean(prob)     = 0.006944
+  std(prob)      = 0.016127
+
+  Top-10 actions by mean prob:
+    rank= 1, action_idx= 138, mean_prob=0.103544
+    rank= 2, action_idx=  66, mean_prob=0.095269
+    rank= 3, action_idx= 109, mean_prob=0.076024
+    rank= 4, action_idx=   0, mean_prob=0.074745
+    rank= 5, action_idx= 133, mean_prob=0.052166
+    rank= 6, action_idx=  55, mean_prob=0.044949
+    rank= 7, action_idx= 124, mean_prob=0.044727
+    rank= 8, action_idx=  39, mean_prob=0.029826
+    rank= 9, action_idx=  33, mean_prob=0.027329
+    rank=10, action_idx= 123, mean_prob=0.026609
+
+[EVAL] saved mean action probs to: eval_action_mean_probs.csv
+[EVAL] saved all step probs (flatten) to: eval_all_probs.npy
+       shape=(1955232,), min=0.000000, max=0.999979
+[EVAL] finished 50 episodes, total_steps=13578, black_wins=25, white_wins=25, draws=0
+
+
+
+
+===========================2300episode====================================
+=========== EVAL SUMMARY (ALL EPISODES) ===========
+  num_episodes        : 50
+  total_steps         : 77978
+  avg steps/episode   : 1559.56
+  total_reward_black  : 0.000
+  total_reward_white  : 0.000
+  black_wins          : 26
+  white_wins          : 24
+  draws               : 0
+
+[EVAL] Average top-k probs over all steps (k=1..5)
+  avg top1 prob = 0.5544  (count=77978)
+  avg top2 prob = 0.1627  (count=77978)
+  avg top3 prob = 0.0784  (count=77978)
+  avg top4 prob = 0.0471  (count=77978)
+  avg top5 prob = 0.0296  (count=77978)
+
+[EVAL] avg policy entropy (all steps) = 1.4851
+
+[EVAL] Mean action probs summary (over all steps):
+  n_actions      = 144
+  min(prob)      = 0.000000
+  max(prob)      = 0.127877
+  mean(prob)     = 0.006944
+  std(prob)      = 0.020363
+
+  Top-10 actions by mean prob:
+    rank= 1, action_idx= 109, mean_prob=0.127877
+    rank= 2, action_idx= 138, mean_prob=0.120964
+    rank= 3, action_idx= 133, mean_prob=0.100677
+    rank= 4, action_idx=   0, mean_prob=0.086927
+    rank= 5, action_idx=  58, mean_prob=0.057862
+    rank= 6, action_idx= 129, mean_prob=0.056948
+    rank= 7, action_idx=  39, mean_prob=0.056057
+    rank= 8, action_idx=  87, mean_prob=0.053140
+    rank= 9, action_idx= 135, mean_prob=0.033799
+    rank=10, action_idx=  42, mean_prob=0.031639
+
+[EVAL] saved mean action probs to: eval_action_mean_probs.csv
+[EVAL] saved all step probs (flatten) to: eval_all_probs.npy
+       shape=(11228832,), min=0.000000, max=0.999982
+[EVAL] finished 50 episodes, total_steps=77978, black_wins=26, white_wins=24, draws=0

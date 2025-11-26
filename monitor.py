@@ -4,9 +4,9 @@ import time
 import csv
 from typing import List, Dict, Any
 
-LOG_PATH = "training_metrics_v3.csv"
+LOG_PATH = "training_metrics.csv"
 REFRESH_SEC = 5           # 몇 초마다 갱신할지
-LAST_N_EPOCHS = -1        # ✅ -1 또는 0 이면 "전체 기간" 사용
+LAST_N_EPOCHS = -1        
 
 def load_metrics(log_path: str) -> List[Dict[str, Any]]:
     if not os.path.exists(log_path):

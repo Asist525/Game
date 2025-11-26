@@ -1,6 +1,6 @@
 #!/usr/bin/env python
 """
-training_metrics_v3.csv를 실시간으로 읽어서
+training_metrics.csv를 실시간으로 읽어서
 - win_rate (%)
 - learner_rating
 - avg_reward
@@ -24,7 +24,7 @@ import matplotlib.pyplot as plt
 # -------------------
 def parse_args():
     p = argparse.ArgumentParser()
-    p.add_argument("--log", default="training_metrics_v3.csv", help="로그 CSV 경로")
+    p.add_argument("--log", default="training_metrics.csv", help="로그 CSV 경로")
     p.add_argument("--refresh", type=float, default=2.0, help="갱신 주기(sec)")
     p.add_argument("--window", default="all", help="'all' 또는 최근 N(정수)")
     p.add_argument("--ma", type=int, default=20, help="이동평균 윈도우(epochs)")

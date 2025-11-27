@@ -456,7 +456,8 @@ def map_stone_to_alive_index(
 class ActorNet(nn.Module):
     def __init__(self, state_dim: int = ACTOR_STATE_DIM, n_actions: int = N_ACTIONS):
         super().__init__()
-        h1, h2, h3 = 256, 256, 256
+        # 히든 크기: 256 → 512로 확장
+        h1, h2, h3 = 512, 512, 512
         self.fc1 = nn.Linear(state_dim, h1)
         self.fc2 = nn.Linear(h1, h2)
         self.fc3 = nn.Linear(h2, h3)
@@ -470,10 +471,12 @@ class ActorNet(nn.Module):
         return logits  # (B, n_actions)
 
 
+
 class CriticNet(nn.Module):
     def __init__(self, state_dim: int = CRITIC_STATE_DIM):
         super().__init__()
-        h1, h2 = 256, 256
+        # 히든 크기: 256 → 512로 확장
+        h1, h2 = 512, 512
         self.fc1 = nn.Linear(state_dim, h1)
         self.fc2 = nn.Linear(h1, h2)
         self.value_head = nn.Linear(h2, 1)
@@ -483,6 +486,7 @@ class CriticNet(nn.Module):
         h = F.relu(self.fc2(h))
         value = self.value_head(h).squeeze(-1)  # (B,)
         return value
+
 
 
 @dataclass
@@ -600,6 +604,33 @@ class PPOPolicy:
         }
         torch.save(ckpt, path)
 
+    @staticmethod
+    def _partial_load_module(module: nn.Module, state_dict: Dict[str, torch.Tensor]) -> None:
+        """
+        old_state_dict에서 가능한 부분만 잘라서 module 파라미터에 복사.
+        (예: 256→512로 키울 때 상단/좌측 블록만 복사)
+        """
+        with torch.no_grad():
+            for name, param in module.named_parameters():
+                if name not in state_dict:
+                    continue
+                old_param = state_dict[name]
+
+                # 차원이 다르면 건너뜀
+                if param.ndim != old_param.ndim:
+                    continue
+
+                if param.ndim == 2:
+                    # weight: (out, in)
+                    out_dim = min(param.size(0), old_param.size(0))
+                    in_dim = min(param.size(1), old_param.size(1))
+                    param[:out_dim, :in_dim].copy_(old_param[:out_dim, :in_dim])
+                elif param.ndim == 1:
+                    # bias: (out,)
+                    out_dim = min(param.size(0), old_param.size(0))
+                    param[:out_dim].copy_(old_param[:out_dim])
+                # 다른 차원은 현재 구조에는 없으니 무시
+
     @classmethod
     def load(
         cls,
@@ -607,24 +638,52 @@ class PPOPolicy:
         device: torch.device | None = None,
         lr: float = 3e-4,
     ) -> "PPOPolicy":
+        """
+        - 512 구조용 새 PPOPolicy를 만든 뒤,
+        - 체크포인트의 actor/critic state_dict을 가능한 한 많이 복사.
+        - 256→512처럼 shape이 안 맞으면 _partial_load_module로 부분 이식.
+        """
         policy = cls(device=device, lr=lr)
         ckpt = torch.load(path, map_location=policy.device)
 
-        if isinstance(ckpt, dict) and "actor_state_dict" in ckpt and "critic_state_dict" in ckpt:
-            policy.actor.load_state_dict(ckpt["actor_state_dict"])
-            policy.critic.load_state_dict(ckpt["critic_state_dict"])
+        def _load_actor_from_state_dict(actor_sd: Dict[str, torch.Tensor]) -> bool:
+            """성공하면 True(완전 로드), shape mismatch로 partial이면 False."""
+            try:
+                policy.actor.load_state_dict(actor_sd)
+                return True
+            except RuntimeError:
+                # shape mismatch → 부분 이식
+                print("[PPOPolicy.load] Actor shape mismatch, applying partial migration (e.g. 256→512).")
+                PPOPolicy._partial_load_module(policy.actor, actor_sd)
+                return False
 
-            # optimizer state가 있으면 같이 로드 (없으면 무시: 구버전 호환)
-            if "optimizer_state_dict" in ckpt:
+        def _load_critic_from_state_dict(critic_sd: Dict[str, torch.Tensor]) -> bool:
+            try:
+                policy.critic.load_state_dict(critic_sd)
+                return True
+            except RuntimeError:
+                print("[PPOPolicy.load] Critic shape mismatch, applying partial migration (e.g. 256→512).")
+                PPOPolicy._partial_load_module(policy.critic, critic_sd)
+                return False
+
+        # 새 포맷: {"actor_state_dict", "critic_state_dict", ...}
+        if isinstance(ckpt, dict) and "actor_state_dict" in ckpt and "critic_state_dict" in ckpt:
+            actor_ok = _load_actor_from_state_dict(ckpt["actor_state_dict"])
+            critic_ok = _load_critic_from_state_dict(ckpt["critic_state_dict"])
+
+            # optimizer_state_dict는 shape이 완전히 맞을 때만 로드 (512↔512)
+            if "optimizer_state_dict" in ckpt and actor_ok and critic_ok:
                 try:
                     policy.optimizer.load_state_dict(ckpt["optimizer_state_dict"])
                 except Exception:
-                    # shape 안 맞거나 하면 그냥 무시하고 새 optimizer 사용
+                    # 안 맞으면 그냥 새 optimizer 사용
                     pass
+
         else:
             # 구버전 호환: 하나의 state_dict만 있을 경우 actor만 로드
             state_dict = ckpt["state_dict"] if isinstance(ckpt, dict) and "state_dict" in ckpt else ckpt
-            policy.actor.load_state_dict(state_dict)
+            _load_actor_from_state_dict(state_dict)
+            # critic은 초기화 상태 그대로 사용 (구버전엔 없으니까)
 
         return policy
 
@@ -742,6 +801,7 @@ class PPOPolicy:
         critic_state_vec = critic_state_t.squeeze(0).detach()
 
         return action, action_idx, logprob, actor_state_vec, critic_state_vec
+
 
 
 # ------------------------------------------------

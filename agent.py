@@ -29,7 +29,8 @@ N_ACTIONS = N_STONES * N_ANGLES * N_POWERS  # 전체 디스크리트 액션 수
 
 # --- 리워드/셰이핑 관련 ---
 STEP_PENALTY = 0.005       # 턴당 -0.005 (너무 길게 끄는 걸 약하게 억제)
-POTENTIAL_ALPHA = 0.25     # 위치 기반 potential Φ_geo(s) 스케일
+POTENTIAL_ALPHA = 0.20     # 위치 기반 potential Φ_geo(s) 스케일 # 살짝 낮춤 0.25->0.2
+ALIVE_POTENTIAL_ALPHA = 0.30 # my_alive - opp_alive 가 +1 늘어날 때마다 대략 +0.3 정도 shaping 보상
 
 
 # ------------------------------------------------
@@ -522,23 +523,39 @@ def compute_alive_diff(obs, my_color: int) -> float:
 
 def potential(obs, my_color: int) -> float:
     """
-    위치 기반 형세 potential Φ_geo(s).
+    위치/돌개수 기반 형세 potential Φ(s).
 
-    - 내 돌은 보드 중앙 쪽(엣지에서 멀게)
-    - 상대 돌은 보드 엣지 쪽(엣지에서 가깝게)
+    구성:
+      - Φ_geo(s)   = POTENTIAL_ALPHA        * (my_min_edge - opp_min_edge)
+      - Φ_alive(s) = ALIVE_POTENTIAL_ALPHA * (my_alive - opp_alive)
 
-    로 두고 싶다는 신호:
-      Φ_geo(s) = POTENTIAL_ALPHA * (my_min_edge - opp_min_edge)
+    최종:
+      Φ(s) = Φ_geo(s) + Φ_alive(s)
+
+    이 Φ(s)를 가지고 step마다 shaping:
+      r_shaped = base_reward + γ Φ(s') - Φ(s)
     """
+
+    # 내/상대 돌 및 정규화
     me, opp, obstacles, _ = split_me_opp(obs, my_color)
     me_norm = normalize_stones(me, BOARD_W, BOARD_H)
     opp_norm = normalize_stones(opp, BOARD_W, BOARD_H)
 
+    # 1) 위치 기반: 엣지까지 최소 거리 차이
     my_min_edge = min_edge_dist(me_norm)
     opp_min_edge = min_edge_dist(opp_norm)
+    geo = my_min_edge - opp_min_edge          # 내 돌이 더 중앙이면 +쪽
+    phi_geo = POTENTIAL_ALPHA * geo
 
-    geo = my_min_edge - opp_min_edge
-    return POTENTIAL_ALPHA * geo
+    # 2) alive 개수 기반: (내 돌 개수 - 상대 돌 개수)
+    my_alive = float((me[:, 2] > 0.5).sum())
+    opp_alive = float((opp[:, 2] > 0.5).sum())
+    alive_diff = my_alive - opp_alive         # [-3, +3] 범위
+    phi_alive = ALIVE_POTENTIAL_ALPHA * alive_diff
+
+    # 위치 + 돌 개수 potential 합산
+    return phi_geo + phi_alive
+
 
 
 def compute_gae_returns(

@@ -27,26 +27,36 @@ N_ANGLES = 16
 N_POWERS = 3
 N_ACTIONS = N_STONES * N_ANGLES * N_POWERS  # 전체 디스크리트 액션 수
 
-# --- 리워드/셰이핑 관련 ---
-STEP_PENALTY = 0.005       # 턴당 -0.005 (너무 길게 끄는 걸 약하게 억제)
-POTENTIAL_ALPHA = 0.25     # 위치 기반 potential Φ_geo(s) 스케일
+# --- 리워드/셰이핑 관련 (심층리서치 철학 반영) ---
+# RL 타임스텝: "내 턴 시작 상태 s_t" → "다음 내 턴 시작 상태 s_{t+1}".
+# 이 사이에 발생하는 모든 env.step(내 샷 + 상대 응수)에 대해 STEP_PENALTY를 누적한다.
+# 너무 큰 값이면 "빨리 지는게 덜 손해" 메타가 생기므로 스케일을 낮게 시작.
+STEP_PENALTY = 0.001         # env step당 -0.001 : 장기전/캠핑 억제(약하게)
+ALIVE_TRADE_WEIGHT = 0.25    # Δalive_diff 당 리워드 계수
+WIN_REWARD = 1.0             # 최종 승/패 보상 (sign(alive_diff) * WIN_REWARD)
+
+# potential-based shaping: Φ_safe + Φ_center (상태 기반, my_color 기준)
+SAFE_ALPHA = 0.15            # Φ_safe 계수
+CENTER_ALPHA = 0.10          # Φ_center 계수
+SAFE_SATURATION_EDGE = 0.25  # 엣지 거리 saturation 임계값
 
 
 # ------------------------------------------------
 # 환경 생성
 # ------------------------------------------------
 def make_env(render_mode=None, bgm: bool = False):
+    """
+    kymnasium AlKkaGi-3x3 환경 생성.
+    env 자체 reward는 0이라고 가정하고, 모든 보상은 이 코드에서 정의한다.
+    """
     env = gym.make(
         "kymnasium/AlKkaGi-3x3-v0",
         obs_type="custom",
-        render_mode=render_mode,   # gym에 render_mode 전달
+        render_mode=render_mode,
         bgm=bgm,
     )
-
-    # OrderEnforcing wrapper 때문에 render_mode는 setter가 없어서
-    # 직접 저장할 때는 다른 이름으로 저장해야 한다.
+    # OrderEnforcing wrapper 우회용 디버그 필드
     env._render_mode_debug = render_mode
-
     return env
 
 
@@ -69,10 +79,10 @@ def split_me_opp(obs, my_color: int):
       obstacles : 장애물 (3, 4)
       turn      : float(0.0 or 1.0)  (env 기준 턴)
     """
-    if my_color == 0:  # 내가 흑
+    if my_color == 0:
         me = np.array(obs["black"], dtype=np.float32)
         opp = np.array(obs["white"], dtype=np.float32)
-    else:              # 내가 백
+    else:
         me = np.array(obs["white"], dtype=np.float32)
         opp = np.array(obs["black"], dtype=np.float32)
 
@@ -85,13 +95,13 @@ def normalize_stones(stones, board_w, board_h):
     """
     stones: (N_STONES, 3) = [x, y, alive]
     x, y를 [0,1]로 정규화 + clip
+    alive 플래그는 그대로 유지.
     """
     out = stones.copy()
-    out[:, 0] /= board_w  # x
-    out[:, 1] /= board_h  # y
+    out[:, 0] /= board_w
+    out[:, 1] /= board_h
     out[:, 0] = np.clip(out[:, 0], 0.0, 1.0)
     out[:, 1] = np.clip(out[:, 1], 0.0, 1.0)
-    # alive는 그대로
     return out
 
 
@@ -101,10 +111,10 @@ def normalize_obstacles(obs_arr, board_w, board_h):
     x, y, w, h를 [0,1] 근처 값으로 정규화 + clip
     """
     out = obs_arr.copy()
-    out[:, 0] /= board_w  # x
-    out[:, 1] /= board_h  # y
-    out[:, 2] /= board_w  # w
-    out[:, 3] /= board_h  # h
+    out[:, 0] /= board_w
+    out[:, 1] /= board_h
+    out[:, 2] /= board_w
+    out[:, 3] /= board_h
 
     out[:, 0] = np.clip(out[:, 0], 0.0, 1.0)
     out[:, 1] = np.clip(out[:, 1], 0.0, 1.0)
@@ -114,7 +124,7 @@ def normalize_obstacles(obs_arr, board_w, board_h):
 
 
 # ------------------------------------------------
-# Baseline 인코더 (31차원, 필요시 사용)
+# Baseline 인코더 (31차원)
 # ------------------------------------------------
 def encode_state_basic_alkkagi(
     obs,
@@ -125,30 +135,27 @@ def encode_state_basic_alkkagi(
     """
     Baseline 관측 인코더 (canonical, me/opp 기준)
 
-    첫 번째 스칼라는 env 절대 턴(0/1)이 아니라,
-    "지금 내 턴이냐?"를 나타내는 turn_is_me ∈ {0,1}.
-
-    실제 학습에서는 encode_state_fe_alkkagi를
-    (obs, my_color=obs["turn"]) 으로만 호출하므로
-    turn_is_me는 항상 1.0이 된다.
+    첫 번째 스칼라는 "지금 내 턴이냐?"를 나타내는 turn_is_me ∈ {0,1}.
+    self-play 루프에서 항상 내 턴일 때만 actor를 호출하므로 실제로는 1.0 고정에 가까움.
     """
     me, opp, obstacles, turn_raw = split_me_opp(obs, my_color)
 
-    # canonical actor 관점: 내 턴이면 1, 아니면 0
     turn_is_me = 1.0 if int(turn_raw) == int(my_color) else 0.0
 
     me_norm = normalize_stones(me, board_w, board_h)
     opp_norm = normalize_stones(opp, board_w, board_h)
     obs_norm = normalize_obstacles(obstacles, board_w, board_h)
 
-    feat = np.concatenate([
-        np.array([turn_is_me], dtype=np.float32),  # (1,)
-        me_norm.flatten(),
-        opp_norm.flatten(),
-        obs_norm.flatten(),
-    ]).astype(np.float32)
+    feat = np.concatenate(
+        [
+            np.array([turn_is_me], dtype=np.float32),
+            me_norm.flatten(),
+            opp_norm.flatten(),
+            obs_norm.flatten(),
+        ]
+    ).astype(np.float32)
 
-    return feat
+    return feat  # (31,)
 
 
 # ------------------------------------------------
@@ -157,10 +164,7 @@ def encode_state_basic_alkkagi(
 def group_stats(stones_norm: np.ndarray) -> np.ndarray:
     """
     stones_norm: (N_STONES, 3) = [x_norm, y_norm, alive]
-    alive 돌만 사용해서:
-      - center_x, center_y
-      - var_x, var_y
-    반환 shape: (4,)
+    alive 돌만 사용해서 center_x, center_y, var_x, var_y 생성.
     """
     alive_mask = stones_norm[:, 2] > 0.5
     if not np.any(alive_mask):
@@ -193,6 +197,44 @@ def min_edge_dist(stones_norm: np.ndarray) -> float:
     return float(edge_dists.min())
 
 
+def stone_edge_distances(stones_norm: np.ndarray) -> np.ndarray:
+    """
+    alive 돌들에 대해 보드 엣지까지의 거리 배열을 반환.
+    """
+    alive_mask = stones_norm[:, 2] > 0.5
+    if not np.any(alive_mask):
+        return np.zeros(0, dtype=np.float32)
+
+    xs = stones_norm[alive_mask, 0]
+    ys = stones_norm[alive_mask, 1]
+
+    edge_dists = np.minimum.reduce([xs, 1.0 - xs, ys, 1.0 - ys])
+    return edge_dists.astype(np.float32)
+
+
+def obstacle_summary(obs_norm: np.ndarray) -> np.ndarray:
+    """
+    obs_norm: (N_OBS, 4) = [x_norm, y_norm, w_norm, h_norm]
+
+    - count
+    - center_x_mean, center_y_mean
+    - w_mean, h_mean
+    """
+    if obs_norm.size == 0:
+        return np.zeros(5, dtype=np.float32)
+
+    cx = obs_norm[:, 0] + obs_norm[:, 2] / 2.0
+    cy = obs_norm[:, 1] + obs_norm[:, 3] / 2.0
+    w = obs_norm[:, 2]
+    h = obs_norm[:, 3]
+
+    cnt = float(obs_norm.shape[0])
+    return np.array(
+        [cnt, cx.mean(), cy.mean(), w.mean(), h.mean()],
+        dtype=np.float32,
+    )
+
+
 def min_pairwise_dist(me_norm: np.ndarray, opp_norm: np.ndarray) -> float:
     """
     alive인 내 돌 vs alive인 상대 돌 사이의 유클리드 거리 중 최소값.
@@ -215,33 +257,8 @@ def min_pairwise_dist(me_norm: np.ndarray, opp_norm: np.ndarray) -> float:
     return float(min_d)
 
 
-def obstacle_summary(obs_norm: np.ndarray) -> np.ndarray:
-    """
-    obs_norm: (N_OBS, 4) = [x_norm, y_norm, w_norm, h_norm]
-
-    - count
-    - center_x_mean, center_y_mean
-    - w_mean, h_mean
-
-    반환 shape: (5,)
-    """
-    if obs_norm.size == 0:
-        return np.zeros(5, dtype=np.float32)
-
-    cx = obs_norm[:, 0] + obs_norm[:, 2] / 2.0
-    cy = obs_norm[:, 1] + obs_norm[:, 3] / 2.0
-    w = obs_norm[:, 2]
-    h = obs_norm[:, 3]
-
-    cnt = float(obs_norm.shape[0])
-    return np.array(
-        [cnt, cx.mean(), cy.mean(), w.mean(), h.mean()],
-        dtype=np.float32,
-    )
-
-
 # ------------------------------------------------
-# 1) 로컬(Actor용) FE 인코더 (canonical, 51차원)
+# Actor용 FE 인코더 (51차원)
 # ------------------------------------------------
 def encode_state_fe_alkkagi(
     obs,
@@ -260,19 +277,15 @@ def encode_state_fe_alkkagi(
         * my_min_edge, op_min_edge, min_my_op_dist (3)
         * obs_cnt, obs_cx_mean, obs_cy_mean, obs_w_mean, obs_h_mean (5)
 
-      => 추가 20차원
-      => 총 31 + 20 = 51차원
+      => 총 51차원
     """
-    # --- 1) baseline feature (31차원) ---
     base_feat = encode_state_basic_alkkagi(obs, my_color, board_w, board_h)
 
-    # --- 2) 정규화된 돌/장애물 ---
     me, opp, obstacles, _ = split_me_opp(obs, my_color)
     me_norm = normalize_stones(me, board_w, board_h)
     opp_norm = normalize_stones(opp, board_w, board_h)
     obs_norm = normalize_obstacles(obstacles, board_w, board_h)
 
-    # --- 3) scalar feature들 ---
     my_alive_cnt = float((me_norm[:, 2] > 0.5).sum())
     opp_alive_cnt = float((opp_norm[:, 2] > 0.5).sum())
     alive_diff = my_alive_cnt - opp_alive_cnt
@@ -284,11 +297,9 @@ def encode_state_fe_alkkagi(
         dtype=np.float32,
     )
 
-    # --- 4) 그룹 요약 ---
-    my_stats = group_stats(me_norm)   # (4,)
-    op_stats = group_stats(opp_norm)  # (4,)
+    my_stats = group_stats(me_norm)
+    op_stats = group_stats(opp_norm)
 
-    # --- 5) 관계 feature ---
     my_min_edge = min_edge_dist(me_norm)
     op_min_edge = min_edge_dist(opp_norm)
     min_my_op = min_pairwise_dist(me_norm, opp_norm)
@@ -298,20 +309,19 @@ def encode_state_fe_alkkagi(
         dtype=np.float32,
     )
 
-    # --- 6) 장애물 요약 ---
-    obs_stats = obstacle_summary(obs_norm)  # (5,)
+    obs_stats = obstacle_summary(obs_norm)
 
-    # --- 7) 전부 concat ---
-    extra_feats = np.concatenate([
-        scalar_feats,   # 4
-        my_stats,       # 4
-        op_stats,       # 4
-        relation_feats, # 3
-        obs_stats,      # 5
-    ]).astype(np.float32)
+    extra_feats = np.concatenate(
+        [
+            scalar_feats,
+            my_stats,
+            op_stats,
+            relation_feats,
+            obs_stats,
+        ]
+    ).astype(np.float32)
 
     feat = np.concatenate([base_feat, extra_feats]).astype(np.float32)
-
     return feat  # (51,)
 
 
@@ -323,10 +333,6 @@ def encode_state_fe_tensor(
     my_color: int,
     device: torch.device | None = None,
 ) -> torch.Tensor:
-    """
-    feature engineering encoder → torch.Tensor
-    shape: (ACTOR_STATE_DIM,)
-    """
     if device is None:
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -336,7 +342,7 @@ def encode_state_fe_tensor(
 
 
 # ------------------------------------------------
-# 2) 중앙 관측(Critic용) 인코더 (non-canonical, 31차원)
+# Critic용 중앙 인코더 (31차원)
 # ------------------------------------------------
 def encode_state_central_alkkagi(
     obs,
@@ -349,7 +355,7 @@ def encode_state_central_alkkagi(
     - black_norm : 3 * (x, y, alive) = 9
     - white_norm : 3 * (x, y, alive) = 9
     - obs_norm   : 3 * (x, y, w, h)   = 12
-    => 1 + 9 + 9 + 12 = 31차원
+    => 31차원
     """
     black = np.array(obs["black"], dtype=np.float32)
     white = np.array(obs["white"], dtype=np.float32)
@@ -360,12 +366,14 @@ def encode_state_central_alkkagi(
     white_norm = normalize_stones(white, board_w, board_h)
     obs_norm = normalize_obstacles(obstacles, board_w, board_h)
 
-    feat = np.concatenate([
-        np.array([turn], dtype=np.float32),
-        black_norm.flatten(),   # 9
-        white_norm.flatten(),   # 9
-        obs_norm.flatten(),     # 12
-    ]).astype(np.float32)
+    feat = np.concatenate(
+        [
+            np.array([turn], dtype=np.float32),
+            black_norm.flatten(),
+            white_norm.flatten(),
+            obs_norm.flatten(),
+        ]
+    ).astype(np.float32)
     return feat  # (31,)
 
 
@@ -376,10 +384,6 @@ def encode_state_central_tensor(
     obs,
     device: torch.device | None = None,
 ) -> torch.Tensor:
-    """
-    중앙 인코더 → torch.Tensor
-    shape: (CRITIC_STATE_DIM,)
-    """
     if device is None:
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     feat_np = encode_state_central_alkkagi(obs, BOARD_W, BOARD_H)
@@ -393,10 +397,6 @@ def encode_state_central_tensor(
 def decode_action_index(action_idx: int):
     """
     디스크리트 액션 인덱스 -> (stone_id, angle, power)로 변환.
-
-    - stone_id ∈ {0,1,2}
-    - angle ∈ [-180, 180] 근처의 균일 그리드
-    - power ∈ [500, 2500] 범위에서 균일 그리드
     """
     per_stone = N_ANGLES * N_POWERS
     stone_id = action_idx // per_stone
@@ -405,11 +405,9 @@ def decode_action_index(action_idx: int):
     angle_id = rem // N_POWERS
     power_id = rem % N_POWERS
 
-    # angle 그리드
     angle_step = 360.0 / N_ANGLES
-    angle = -180.0 + (angle_id + 0.5) * angle_step  # 중앙값
+    angle = -180.0 + (angle_id + 0.5) * angle_step
 
-    # power 그리드
     power_min, power_max = 500.0, 2500.0
     if N_POWERS == 1:
         power = (power_min + power_max) / 2.0
@@ -426,23 +424,14 @@ def map_stone_to_alive_index(
     stone_id: int,
 ) -> int:
     """
-    디스크리트 action에서 나온 stone_id(0,1,2)를
-    실제로 alive 상태인 돌들 중 하나로 매핑한다.
-
-    - my_color == 0 → obs["black"]
-    - my_color == 1 → obs["white"]
-    - alive 인덱스만 모아서, stone_id를 alive 개수로 mod 후
-      그 번째 alive 돌을 선택.
+    stone_id(0,1,2)를 실제 alive 돌 인덱스로 매핑.
     """
     if my_color == 0:
         stones = observation["black"]
     else:
         stones = observation["white"]
 
-    # stones: (3, 3) = [x, y, alive]
     alive_indices = [i for i, s in enumerate(stones) if s[2] > 0.5]
-
-    # alive 돌이 하나도 없으면 그냥 0으로 (어차피 게임 끝 직전 상태일 것)
     if not alive_indices:
         return 0
 
@@ -451,12 +440,12 @@ def map_stone_to_alive_index(
 
 
 # ------------------------------------------------
-# Policy / Value Network 분리 (CTDE)
+# PPO 네트워크
 # ------------------------------------------------
 class ActorNet(nn.Module):
     def __init__(self, state_dim: int = ACTOR_STATE_DIM, n_actions: int = N_ACTIONS):
         super().__init__()
-        h1, h2, h3 = 256, 256, 256
+        h1, h2, h3 = 512, 512, 512
         self.fc1 = nn.Linear(state_dim, h1)
         self.fc2 = nn.Linear(h1, h2)
         self.fc3 = nn.Linear(h2, h3)
@@ -467,13 +456,13 @@ class ActorNet(nn.Module):
         h = F.relu(self.fc2(h))
         h = F.relu(self.fc3(h))
         logits = self.policy_head(h)
-        return logits  # (B, n_actions)
+        return logits
 
 
 class CriticNet(nn.Module):
     def __init__(self, state_dim: int = CRITIC_STATE_DIM):
         super().__init__()
-        h1, h2 = 256, 256
+        h1, h2 = 512, 512
         self.fc1 = nn.Linear(state_dim, h1)
         self.fc2 = nn.Linear(h1, h2)
         self.value_head = nn.Linear(h2, 1)
@@ -481,7 +470,7 @@ class CriticNet(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         h = F.relu(self.fc1(x))
         h = F.relu(self.fc2(h))
-        value = self.value_head(h).squeeze(-1)  # (B,)
+        value = self.value_head(h).squeeze(-1)
         return value
 
 
@@ -490,20 +479,20 @@ class PPOConfig:
     gamma: float = 0.99
     gae_lambda: float = 0.95
     clip_coef: float = 0.2
-    ent_coef: float = 0.01
+    ent_coef: float = 0.01      # 엔트로피 계수 약간 상향
     vf_coef: float = 0.5
     max_grad_norm: float = 0.5
-    learning_rate: float = 3e-4
-    update_epochs: int = 2
-    batch_size: int = 512
+    learning_rate: float = 1e-4
+    update_epochs: int = 3
+    batch_size: int = 64
 
 
 # ------------------------------------------------
-# 리워드 / Potential-based shaping / GAE
+# 리워드 관련 함수들 (심층리서치 구조)
 # ------------------------------------------------
-def compute_alive_diff(obs, my_color: int) -> float:
+def compute_alive_counts(obs, my_color: int) -> Tuple[float, float]:
     """
-    any state에서 my_color 입장에서 alive_diff 계산.
+    현재 상태에서 my_color 입장에서 (my_alive, opp_alive) 반환.
     """
     me, opp, _, _ = split_me_opp(obs, my_color)
     me = np.array(me, dtype=np.float32)
@@ -511,30 +500,72 @@ def compute_alive_diff(obs, my_color: int) -> float:
 
     my_alive = float((me[:, 2] > 0.5).sum())
     opp_alive = float((opp[:, 2] > 0.5).sum())
-    alive_diff = my_alive - opp_alive  # [-3, +3] 범위
+    return my_alive, opp_alive
 
-    return alive_diff
+
+def compute_alive_diff(obs, my_color: int) -> float:
+    """
+    현재 상태에서 my_color 입장에서 alive_diff 계산.
+    """
+    my_alive, opp_alive = compute_alive_counts(obs, my_color)
+    return my_alive - opp_alive  # [-3, +3]
+
+
+def safe_score_side(stones_norm: np.ndarray) -> float:
+    """
+    엣지로부터의 거리에 기반한 안전도 점수 (0~1).
+    SAFE_SATURATION_EDGE 이상이면 포화되도록 설계.
+    """
+    d = stone_edge_distances(stones_norm)
+    if d.size == 0:
+        return 0.0
+    # [0, SAFE_SATURATION_EDGE] 구간을 [0,1]로 정규화, 그 이상은 1로 포화
+    h = np.minimum(d, SAFE_SATURATION_EDGE) / SAFE_SATURATION_EDGE
+    return float(h.mean())
+
+
+def center_score_side(stones_norm: np.ndarray) -> float:
+    """
+    보드 중심(0.5,0.5)으로부터 거리 기반 중앙 점유 점수 (0~1).
+    중앙에 가까울수록 1, 코너에 가까울수록 0 근처.
+    """
+    alive_mask = stones_norm[:, 2] > 0.5
+    if not np.any(alive_mask):
+        return 0.0
+
+    xs = stones_norm[alive_mask, 0]
+    ys = stones_norm[alive_mask, 1]
+    dx = xs - 0.5
+    dy = ys - 0.5
+    dist = np.sqrt(dx * dx + dy * dy)  # [0, ~0.707]
+    max_dist = np.sqrt(2.0) / 2.0  # ≈0.707
+
+    norm = 1.0 - np.clip(dist / max_dist, 0.0, 1.0)
+    return float(norm.mean())
 
 
 def potential(obs, my_color: int) -> float:
     """
-    위치 기반 형세 potential Φ_geo(s).
-
-    - 내 돌은 보드 중앙 쪽(엣지에서 멀게)
-    - 상대 돌은 보드 엣지 쪽(엣지에서 가깝게)
-
-    로 두고 싶다는 신호:
-      Φ_geo(s) = POTENTIAL_ALPHA * (my_min_edge - opp_min_edge)
+    순수 상태 기반 potential Φ(s).
+    - alive_diff는 base reward에서만 다루고, Φ에는 포함하지 않는다.
+    - Φ_safe: 엣지로부터의 안전도 차이 (saturation 포함)
+    - Φ_center: 중앙 점유도 차이
+    Φ(s) = SAFE_ALPHA * (safe_our - safe_opp)
+         + CENTER_ALPHA * (center_our - center_opp)
     """
-    me, opp, obstacles, _ = split_me_opp(obs, my_color)
+    me, opp, _, _ = split_me_opp(obs, my_color)
     me_norm = normalize_stones(me, BOARD_W, BOARD_H)
     opp_norm = normalize_stones(opp, BOARD_W, BOARD_H)
 
-    my_min_edge = min_edge_dist(me_norm)
-    opp_min_edge = min_edge_dist(opp_norm)
+    safe_our = safe_score_side(me_norm)
+    safe_opp = safe_score_side(opp_norm)
+    center_our = center_score_side(me_norm)
+    center_opp = center_score_side(opp_norm)
 
-    geo = my_min_edge - opp_min_edge
-    return POTENTIAL_ALPHA * geo
+    phi_safe = safe_our - safe_opp
+    phi_center = center_our - center_opp
+
+    return SAFE_ALPHA * phi_safe + CENTER_ALPHA * phi_center
 
 
 def compute_gae_returns(
@@ -547,8 +578,7 @@ def compute_gae_returns(
     """
     단일 에피소드에 대해 GAE + return 계산.
     rewards: (T,)
-    values : (T,)   rollout 동안 critic(s_t)
-    bootstrap_value_last : truncated일 때 V(s_{T}), terminated면 0.0
+    values : (T,)  (각 t에서의 V(s_t))
     """
     T = len(rewards)
     advantages = np.zeros(T, dtype=np.float32)
@@ -568,16 +598,10 @@ def compute_gae_returns(
 
 
 # ------------------------------------------------
-# PPO Policy (Actor/ Critic 분리)
+# PPO Policy (Actor / Critic 분리)
 # ------------------------------------------------
 class PPOPolicy:
-    """
-    하나의 ActorNet(로컬/캐노니컬) + CriticNet(중앙)을 흑/백 모두가 공유하는 PPO 정책.
-    - act_eval : 평가용 (deterministic argmax or sampling)
-    - act_train: 학습용 (logprob, actor_state, critic_state 반환)
-    """
-
-    def __init__(self, device: torch.device | None = None, lr: float = 3e-4):
+    def __init__(self, device: torch.device | None = None, lr: float = 1e-4):
         if device is None:
             device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.device = device
@@ -595,36 +619,73 @@ class PPOPolicy:
         ckpt = {
             "actor_state_dict": self.actor.state_dict(),
             "critic_state_dict": self.critic.state_dict(),
-            # 이어학습을 위해 optimizer state도 같이 저장
             "optimizer_state_dict": self.optimizer.state_dict(),
         }
         torch.save(ckpt, path)
+
+    @staticmethod
+    def _partial_load_module(module: nn.Module, state_dict: Dict[str, torch.Tensor]) -> None:
+        """
+        old_state_dict에서 가능한 부분만 잘라서 module 파라미터에 복사.
+        (예: 256→512로 키울 때 상단/좌측 블록만 복사)
+        """
+        with torch.no_grad():
+            for name, param in module.named_parameters():
+                if name not in state_dict:
+                    continue
+                old_param = state_dict[name]
+
+                if param.ndim != old_param.ndim:
+                    continue
+
+                if param.ndim == 2:
+                    out_dim = min(param.size(0), old_param.size(0))
+                    in_dim = min(param.size(1), old_param.size(1))
+                    param[:out_dim, :in_dim].copy_(old_param[:out_dim, :in_dim])
+                elif param.ndim == 1:
+                    out_dim = min(param.size(0), old_param.size(0))
+                    param[:out_dim].copy_(old_param[:out_dim])
 
     @classmethod
     def load(
         cls,
         path: str,
         device: torch.device | None = None,
-        lr: float = 3e-4,
+        lr: float = 1e-4,
     ) -> "PPOPolicy":
         policy = cls(device=device, lr=lr)
         ckpt = torch.load(path, map_location=policy.device)
 
-        if isinstance(ckpt, dict) and "actor_state_dict" in ckpt and "critic_state_dict" in ckpt:
-            policy.actor.load_state_dict(ckpt["actor_state_dict"])
-            policy.critic.load_state_dict(ckpt["critic_state_dict"])
+        def _load_actor_from_state_dict(actor_sd: Dict[str, torch.Tensor]) -> bool:
+            try:
+                policy.actor.load_state_dict(actor_sd)
+                return True
+            except RuntimeError:
+                print("[PPOPolicy.load] Actor shape mismatch, applying partial migration.")
+                PPOPolicy._partial_load_module(policy.actor, actor_sd)
+                return False
 
-            # optimizer state가 있으면 같이 로드 (없으면 무시: 구버전 호환)
-            if "optimizer_state_dict" in ckpt:
+        def _load_critic_from_state_dict(critic_sd: Dict[str, torch.Tensor]) -> bool:
+            try:
+                policy.critic.load_state_dict(critic_sd)
+                return True
+            except RuntimeError:
+                print("[PPOPolicy.load] Critic shape mismatch, applying partial migration.")
+                PPOPolicy._partial_load_module(policy.critic, critic_sd)
+                return False
+
+        if isinstance(ckpt, dict) and "actor_state_dict" in ckpt and "critic_state_dict" in ckpt:
+            actor_ok = _load_actor_from_state_dict(ckpt["actor_state_dict"])
+            critic_ok = _load_critic_from_state_dict(ckpt["critic_state_dict"])
+
+            if "optimizer_state_dict" in ckpt and actor_ok and critic_ok:
                 try:
                     policy.optimizer.load_state_dict(ckpt["optimizer_state_dict"])
                 except Exception:
-                    # shape 안 맞거나 하면 그냥 무시하고 새 optimizer 사용
                     pass
         else:
-            # 구버전 호환: 하나의 state_dict만 있을 경우 actor만 로드
             state_dict = ckpt["state_dict"] if isinstance(ckpt, dict) and "state_dict" in ckpt else ckpt
-            policy.actor.load_state_dict(state_dict)
+            _load_actor_from_state_dict(state_dict)
 
         return policy
 
@@ -634,13 +695,12 @@ class PPOPolicy:
         observation: dict,
         my_color: int,
         greedy: bool = False,
-        temperature: float = 1,
+        temperature: float = 1.0,
     ) -> dict:
         """
         평가용 act.
-        - greedy=True  이면 argmax 정책 (대회/리더보드용)
-        - greedy=False 이면 샘플링 정책 (디버그/관찰용)
-        - temperature != 1.0 이면 logits / T 후 softmax (T>1: 더 random)
+        greedy=True  → argmax (대회용)
+        greedy=False → 샘플링
         """
         self.actor.eval()
 
@@ -648,7 +708,7 @@ class PPOPolicy:
             observation,
             my_color=my_color,
             device=self.device,
-        ).unsqueeze(0)  # (1, state_dim)
+        ).unsqueeze(0)
 
         logits = self.actor(state_t)
         if temperature != 1.0:
@@ -657,17 +717,13 @@ class PPOPolicy:
         dist = torch.distributions.Categorical(logits=logits)
 
         if greedy:
-            probs = dist.probs  # (1, A)
-            action_idx_t = probs.argmax(dim=-1)  # (1,)
+            probs = dist.probs
+            action_idx_t = probs.argmax(dim=-1)
         else:
-            action_idx_t = dist.sample()  # (1,)
+            action_idx_t = dist.sample()
 
         action_idx = int(action_idx_t.item())
-
-        # 디스크리트 → (stone_id, angle, power)
         stone_id, angle, power = decode_action_index(action_idx)
-
-        # alive 돌로 매핑
         stone_id = map_stone_to_alive_index(
             observation=observation,
             my_color=my_color,
@@ -686,44 +742,39 @@ class PPOPolicy:
         self,
         observation: dict,
         my_color: int,
-    ) -> tuple[dict, int, float, torch.Tensor, torch.Tensor]:
+    ) -> Tuple[dict, int, float, torch.Tensor, torch.Tensor]:
         """
         학습용 act.
-        반환:
-        - action dict        : env.step()에 넣을 액션
-        - action_idx         : 디스크리트 액션 인덱스 (0 ~ N_ACTIONS-1)
-        - logprob            : log π(a|s)
-        - actor_state_vec    : (ACTOR_STATE_DIM,) canonical 상태 벡터
-        - critic_state_vec   : (CRITIC_STATE_DIM,) central 상태 벡터
+        - action dict
+        - action_idx
+        - logprob
+        - actor_state_vec
+        - critic_state_vec
+        (둘 다 "내 턴 시작 상태 s_t" 기준)
         """
         self.actor.train()
         self.critic.train()
 
-        # Actor용 canonical 인코딩
         actor_state_t = encode_state_fe_tensor(
             observation,
             my_color=my_color,
             device=self.device,
         ).unsqueeze(0)
 
-        # Critic용 central 인코딩
         critic_state_t = encode_state_central_tensor(
             observation,
             device=self.device,
         ).unsqueeze(0)
 
-        # policy 분포
         logits = self.actor(actor_state_t)
         dist = torch.distributions.Categorical(logits=logits)
 
-        # 학습 때는 샘플링 기반
         action_idx_t = dist.sample()
         logprob_t = dist.log_prob(action_idx_t)
 
         action_idx = int(action_idx_t.item())
         logprob = float(logprob_t.item())
 
-        # 디스크리트 → (stone_id, angle, power)
         stone_id, angle, power = decode_action_index(action_idx)
         stone_id = map_stone_to_alive_index(
             observation=observation,
@@ -745,7 +796,7 @@ class PPOPolicy:
 
 
 # ------------------------------------------------
-# PPO 업데이트 (Actor/ Critic 분리, CTDE)
+# PPO 업데이트 (엔트로피/Top-k/ KL/ clip_frac 로그 + 액션 분포)
 # ------------------------------------------------
 def ppo_update(
     policy: PPOPolicy,
@@ -756,23 +807,54 @@ def ppo_update(
     advantages: List[float],
     returns: List[float],
     config: PPOConfig,
-):
+) -> Dict[str, float]:
     device = policy.device
     policy.actor.train()
     policy.critic.train()
 
-    actor_states_t = torch.stack(actor_states).to(device)    # (N, ACTOR_STATE_DIM)
-    critic_states_t = torch.stack(critic_states).to(device)  # (N, CRITIC_STATE_DIM)
-    actions_t = torch.tensor(actions, dtype=torch.long, device=device)             # (N,)
-    old_logprobs_t = torch.tensor(old_logprobs, dtype=torch.float32, device=device)  # (N,)
-    advantages_t = torch.tensor(advantages, dtype=torch.float32, device=device)      # (N,)
-    returns_t = torch.tensor(returns, dtype=torch.float32, device=device)            # (N,)
+    actor_states_t = torch.stack(actor_states).to(device)
+    critic_states_t = torch.stack(critic_states).to(device)
+    actions_t = torch.tensor(actions, dtype=torch.long, device=device)
+    old_logprobs_t = torch.tensor(old_logprobs, dtype=torch.float32, device=device)
+    advantages_t = torch.tensor(advantages, dtype=torch.float32, device=device)
+    returns_t = torch.tensor(returns, dtype=torch.float32, device=device)
 
-    # advantage 정규화
     advantages_t = (advantages_t - advantages_t.mean()) / (advantages_t.std() + 1e-8)
 
     N = actor_states_t.size(0)
     batch_size = min(config.batch_size, N)
+
+    policy_losses: List[float] = []
+    value_losses: List[float] = []
+    entropies: List[float] = []
+    approx_kls: List[float] = []
+    clip_fracs: List[float] = []
+    top1_means: List[float] = []
+    top5_means: List[float] = []
+    top20_means: List[float] = []
+    top50_means: List[float] = []
+    grad_norms: List[float] = []
+
+    # 액션 분포 (stone/power) 집계
+    power0_ratio = power1_ratio = power2_ratio = 0.0
+    stone0_ratio = stone1_ratio = stone2_ratio = 0.0
+    if N > 0:
+        with torch.no_grad():
+            per_stone = N_ANGLES * N_POWERS
+            actions_all = actions_t.clone()
+            stone_ids = actions_all // per_stone
+            rem = actions_all % per_stone
+            power_ids = rem % N_POWERS
+
+            stone0_ratio = (stone_ids == 0).float().mean().item()
+            stone1_ratio = (stone_ids == 1).float().mean().item()
+            stone2_ratio = (stone_ids == 2).float().mean().item()
+
+            power0_ratio = (power_ids == 0).float().mean().item()
+            if N_POWERS >= 2:
+                power1_ratio = (power_ids == 1).float().mean().item()
+            if N_POWERS >= 3:
+                power2_ratio = (power_ids == 2).float().mean().item()
 
     for _ in range(config.update_epochs):
         idx = torch.randperm(N, device=device)
@@ -787,13 +869,36 @@ def ppo_update(
             mb_adv = advantages_t[mb_idx]
             mb_returns = returns_t[mb_idx]
 
-            # Policy
-            logits = policy.actor(mb_actor_states)      # (B, A)
+            logits = policy.actor(mb_actor_states)
             dist = torch.distributions.Categorical(logits=logits)
-            new_logprobs = dist.log_prob(mb_actions)    # (B,)
+            new_logprobs = dist.log_prob(mb_actions)
             entropy = dist.entropy().mean()
 
-            ratio = (new_logprobs - mb_old_logprobs).exp()
+            # ratio, KL, clip_frac
+            logratio = new_logprobs - mb_old_logprobs
+            ratio = logratio.exp()
+            approx_kl = ((ratio - 1.0) - logratio).mean()
+
+            clip_mask = (ratio - 1.0).abs() > config.clip_coef
+            clip_frac = clip_mask.float().mean()
+
+            # top-k 확률
+            probs = dist.probs.detach()  # (B, A)
+            sorted_probs, _ = torch.sort(probs, dim=-1, descending=True)
+            top1 = sorted_probs[:, 0]
+            k5 = min(5, sorted_probs.size(1))
+            k20 = min(20, sorted_probs.size(1))
+            k50 = min(50, sorted_probs.size(1))
+            top5 = sorted_probs[:, :k5].sum(dim=-1)
+            top20 = sorted_probs[:, :k20].sum(dim=-1)
+            top50 = sorted_probs[:, :k50].sum(dim=-1)
+
+            top1_means.append(top1.mean().item())
+            top5_means.append(top5.mean().item())
+            top20_means.append(top20.mean().item())
+            top50_means.append(top50.mean().item())
+
+            # PPO objective
             surr1 = ratio * mb_adv
             surr2 = torch.clamp(
                 ratio,
@@ -802,48 +907,58 @@ def ppo_update(
             ) * mb_adv
             policy_loss = -torch.min(surr1, surr2).mean()
 
-            # Value (central critic)
-            values = policy.critic(mb_critic_states)    # (B,)
+            values = policy.critic(mb_critic_states)
             value_loss = F.mse_loss(values, mb_returns)
 
             loss = policy_loss + config.vf_coef * value_loss - config.ent_coef * entropy
 
             policy.optimizer.zero_grad()
             loss.backward()
-            nn.utils.clip_grad_norm_(
-                list(policy.actor.parameters()) + list(policy.critic.parameters()),
-                config.max_grad_norm,
-            )
+            total_params = list(policy.actor.parameters()) + list(policy.critic.parameters())
+            grad_norm = nn.utils.clip_grad_norm_(total_params, config.max_grad_norm)
+            if isinstance(grad_norm, torch.Tensor):
+                grad_norm_val = float(grad_norm.item())
+            else:
+                grad_norm_val = float(grad_norm)
+            grad_norms.append(grad_norm_val)
+
             policy.optimizer.step()
 
+            # 로그용 누적
+            policy_losses.append(policy_loss.item())
+            value_losses.append(value_loss.item())
+            entropies.append(entropy.item())
+            approx_kls.append(approx_kl.item())
+            clip_fracs.append(clip_frac.item())
+
+    metrics: Dict[str, float] = {}
+    metrics["policy_loss"] = float(np.mean(policy_losses)) if policy_losses else 0.0
+    metrics["value_loss"] = float(np.mean(value_losses)) if value_losses else 0.0
+    metrics["entropy_mean"] = float(np.mean(entropies)) if entropies else 0.0
+    metrics["entropy_std"] = float(np.std(entropies)) if entropies else 0.0
+    metrics["approx_kl"] = float(np.mean(approx_kls)) if approx_kls else 0.0
+    metrics["clip_frac"] = float(np.mean(clip_fracs)) if clip_fracs else 0.0
+    metrics["top1_prob_mean"] = float(np.mean(top1_means)) if top1_means else 0.0
+    metrics["top5_prob_mean"] = float(np.mean(top5_means)) if top5_means else 0.0
+    metrics["top20_prob_mean"] = float(np.mean(top20_means)) if top20_means else 0.0
+    metrics["top50_prob_mean"] = float(np.mean(top50_means)) if top50_means else 0.0
+    metrics["grad_norm_mean"] = float(np.mean(grad_norms)) if grad_norms else 0.0
+    metrics["lr"] = float(policy.optimizer.param_groups[0]["lr"])
+    metrics["power0_ratio"] = power0_ratio
+    metrics["power1_ratio"] = power1_ratio
+    metrics["power2_ratio"] = power2_ratio
+    metrics["stone0_ratio"] = stone0_ratio
+    metrics["stone1_ratio"] = stone1_ratio
+    metrics["stone2_ratio"] = stone2_ratio
+
+    return metrics
+
 
 # ------------------------------------------------
-# Policy 클론
-# ------------------------------------------------
-def clone_policy(src: PPOPolicy, new_lr: float | None = None) -> PPOPolicy:
-    """
-    learner policy를 snapshot으로 복사.
-    """
-    device = src.device
-    if new_lr is None:
-        lr = src.optimizer.param_groups[0]["lr"]
-    else:
-        lr = new_lr
-
-    new_policy = PPOPolicy(device=device, lr=lr)
-    new_policy.actor.load_state_dict(src.actor.state_dict())
-    new_policy.critic.load_state_dict(src.critic.state_dict())
-    return new_policy
-
-
-# ------------------------------------------------
-# ELO / 리그 (상대 샘플링)
+# ELO / 리그
 # ------------------------------------------------
 @dataclass
 class RatedPolicy:
-    """
-    ELO 리그에서 하나의 정책 엔트리.
-    """
     id: str
     policy: PPOPolicy
     rating: float = 1500.0
@@ -851,9 +966,6 @@ class RatedPolicy:
 
 
 def elo_expected(ra: float, rb: float) -> float:
-    """
-    E_A = 1 / (1 + 10^((Rb - Ra)/400))
-    """
     return 1.0 / (1.0 + 10.0 ** ((rb - ra) / 400.0))
 
 
@@ -863,23 +975,14 @@ def elo_update(
     score_a: float,
     k: float = 32.0,
 ) -> Tuple[float, float]:
-    """
-    score_a: A의 실제 결과 (1=승, 0.5=무, 0=패)
-    """
     ea = elo_expected(ra, rb)
     eb = 1.0 - ea
-
     ra_new = ra + k * (score_a - ea)
     rb_new = rb + k * ((1.0 - score_a) - eb)
     return ra_new, rb_new
 
 
 class EloLeague:
-    """
-    ELO 기반 self-play 리그 구조.
-    rating 차이에 대한 softmax(-|Δrating| / temperature)로 opponent 샘플링.
-    """
-
     def __init__(self, players: List[RatedPolicy], k: float = 32.0, temperature: float = 200.0):
         self.players = players
         self.k = k
@@ -892,19 +995,12 @@ class EloLeague:
         raise ValueError(f"player_id '{player_id}' not found")
 
     def choose_opponent(self, learner_id: str) -> RatedPolicy:
-        """
-        softmax(-|Δrating| / T) 분포로 opponent 샘플링.
-        rating 가까운 상대를 자주, 가끔은 먼 상대도 선택.
-        """
         li = self.find_index(learner_id)
         learner = self.players[li]
 
-        candidates = [
-            p for p in self.players
-            if p.id != learner_id
-        ]
+        candidates = [p for p in self.players if p.id != learner_id]
         if not candidates:
-            raise RuntimeError("opponent candidates가 없습니다.")
+            raise RuntimeError("no opponent candidates")
 
         diffs = np.array([abs(p.rating - learner.rating) for p in candidates], dtype=np.float32)
         weights = np.exp(-diffs / self.temperature)
@@ -913,20 +1009,15 @@ class EloLeague:
         weights /= weights.sum()
 
         idx = np.random.choice(len(candidates), p=weights)
-        opponent = candidates[idx]
-        return opponent
+        return candidates[idx]
 
     def update_result(self, a_id: str, b_id: str, score_a: float) -> None:
-        """
-        경기 결과를 기록하고, 양쪽 rating 업데이트.
-        """
         ai = self.find_index(a_id)
         bi = self.find_index(b_id)
         pa = self.players[ai]
         pb = self.players[bi]
 
         ra_new, rb_new = elo_update(pa.rating, pb.rating, score_a, k=self.k)
-
         pa.rating = ra_new
         pb.rating = rb_new
         pa.games += 1
@@ -934,7 +1025,7 @@ class EloLeague:
 
 
 # ------------------------------------------------
-# 체크포인트 / 로그
+# 체크포인트 / 로그 (1: performance, 2: reward, 3: PPO diagnostics)
 # ------------------------------------------------
 def save_checkpoint_policy(
     policy: PPOPolicy,
@@ -942,16 +1033,10 @@ def save_checkpoint_policy(
     checkpoint_dir: str = "checkpoints",
     max_keep: int = 20,
 ) -> str:
-    """
-    policy 파라미터를 checkpoint_dir에 저장하고,
-    최근 max_keep개만 남기고 나머지는 삭제한다.
-    """
     os.makedirs(checkpoint_dir, exist_ok=True)
-
     ckpt_path = os.path.join(checkpoint_dir, f"policy_epoch_{epoch:06d}.pt")
     policy.save(ckpt_path)
 
-    # 오래된 것 정리
     ckpts = sorted(Path(checkpoint_dir).glob("policy_epoch_*.pt"))
     if len(ckpts) > max_keep:
         for old in ckpts[:-max_keep]:
@@ -969,21 +1054,31 @@ def append_epoch_log(
     wins: int,
     draws: int,
     losses: int,
-    avg_reward: float,
+    avg_alive_diff: float,
     avg_steps: float,
+    steps_p50: float,
+    steps_p90: float,
+    steps_max: float,
     learner_rating: float,
     num_players: int,
+    early_my_alive_avg: float,
+    early_opp_alive_avg: float,
+    early_alive_drop_ratio: float,
+    early_avg_power: float,
     log_path: str = "training_metrics.csv",
 ) -> None:
     """
-    에폭 단위 학습 품질 로그를 CSV로 남긴다.
+    2번 CSV: 성능/리그 관련 메트릭 (승률, 스텝, ELO 등 + early behaviour)
     """
     file_exists = os.path.exists(log_path)
 
     if not file_exists:
         with open(log_path, "w", encoding="utf-8") as f:
             f.write(
-                "epoch,episodes,wins,draws,losses,win_rate,avg_reward,avg_steps,learner_rating,num_players\n"
+                "epoch,episodes,wins,draws,losses,win_rate,"
+                "avg_alive_diff,avg_steps,steps_p50,steps_p90,steps_max,"
+                "learner_rating,num_players,"
+                "early_my_alive_avg,early_opp_alive_avg,early_alive_drop_ratio,early_avg_power\n"
             )
 
     win_rate = wins / episodes if episodes > 0 else 0.0
@@ -991,33 +1086,120 @@ def append_epoch_log(
     with open(log_path, "a", encoding="utf-8") as f:
         f.write(
             f"{epoch},{episodes},{wins},{draws},{losses},"
-            f"{win_rate:.6f},{avg_reward:.6f},{avg_steps:.6f},"
-            f"{learner_rating:.6f},{num_players}\n"
+            f"{win_rate:.6f},{avg_alive_diff:.6f},{avg_steps:.6f},"
+            f"{steps_p50:.6f},{steps_p90:.6f},{steps_max:.6f},"
+            f"{learner_rating:.6f},{num_players},"
+            f"{early_my_alive_avg:.6f},{early_opp_alive_avg:.6f},"
+            f"{early_alive_drop_ratio:.6f},{early_avg_power:.6f}\n"
         )
 
 
-# ★★★ 이어학습용: 최신 체크포인트 찾기 ★★★
+def append_reward_breakdown_log(
+    epoch: int,
+    episodes: int,
+    avg_step_penalty: float,
+    avg_trade: float,
+    avg_shaping: float,
+    avg_game_reward: float,
+    avg_phi_abs: float,
+    log_path: str = "reward_breakdown_metrics.csv",
+) -> None:
+    """
+    1번 CSV: 에포크 단위 리워드 구성요소 평균 로그
+      - avg_step_penalty : episode당 step_penalty 합 (보통 음수)
+      - avg_trade        : episode당 alive_trade 합
+      - avg_shaping      : episode당 potential shaping 합
+      - avg_game_reward  : episode당 최종 WIN_REWARD 합
+      - total_avg_reward : 위 네 항목 합
+      - avg_phi_abs      : segment당 |Φ(s)| 평균 (포지셔닝 shaping 스케일)
+    """
+    file_exists = os.path.exists(log_path)
+
+    if not file_exists:
+        with open(log_path, "w", encoding="utf-8") as f:
+            f.write(
+                "epoch,episodes,avg_step_penalty,avg_alive_trade,"
+                "avg_shaping,avg_game_reward,total_avg_reward,avg_phi_abs\n"
+            )
+
+    total_avg_reward = avg_step_penalty + avg_trade + avg_shaping + avg_game_reward
+
+    with open(log_path, "a", encoding="utf-8") as f:
+        f.write(
+            f"{epoch},{episodes},"
+            f"{avg_step_penalty:.6f},{avg_trade:.6f},{avg_shaping:.6f},"
+            f"{avg_game_reward:.6f},{total_avg_reward:.6f},{avg_phi_abs:.6f}\n"
+        )
+
+
+def append_ppo_metrics_log(
+    epoch: int,
+    num_samples: int,
+    metrics: Dict[str, float],
+    log_path: str = "ppo_diagnostics_metrics.csv",
+) -> None:
+    """
+    3번 CSV: PPO 최적화/정책 형태 진단용 메트릭 로그
+      - policy_loss, value_loss
+      - entropy_mean, entropy_std
+      - approx_kl, clip_frac
+      - top1_prob_mean, top5_prob_mean, top20_prob_mean, top50_prob_mean
+      - grad_norm_mean, lr
+      - power0_ratio, power1_ratio, power2_ratio
+      - stone0_ratio, stone1_ratio, stone2_ratio
+    """
+    file_exists = os.path.exists(log_path)
+
+    if not file_exists:
+        with open(log_path, "w", encoding="utf-8") as f:
+            f.write(
+                "epoch,num_samples,policy_loss,value_loss,"
+                "entropy_mean,entropy_std,approx_kl,clip_frac,"
+                "top1_prob_mean,top5_prob_mean,top20_prob_mean,top50_prob_mean,"
+                "grad_norm_mean,lr,"
+                "power0_ratio,power1_ratio,power2_ratio,"
+                "stone0_ratio,stone1_ratio,stone2_ratio\n"
+            )
+
+    with open(log_path, "a", encoding="utf-8") as f:
+        f.write(
+            f"{epoch},{num_samples},"
+            f"{metrics.get('policy_loss', 0.0):.6f},"
+            f"{metrics.get('value_loss', 0.0):.6f},"
+            f"{metrics.get('entropy_mean', 0.0):.6f},"
+            f"{metrics.get('entropy_std', 0.0):.6f},"
+            f"{metrics.get('approx_kl', 0.0):.6f},"
+            f"{metrics.get('clip_frac', 0.0):.6f},"
+            f"{metrics.get('top1_prob_mean', 0.0):.6f},"
+            f"{metrics.get('top5_prob_mean', 0.0):.6f},"
+            f"{metrics.get('top20_prob_mean', 0.0):.6f},"
+            f"{metrics.get('top50_prob_mean', 0.0):.6f},"
+            f"{metrics.get('grad_norm_mean', 0.0):.6f},"
+            f"{metrics.get('lr', 0.0):.8f},"
+            f"{metrics.get('power0_ratio', 0.0):.6f},"
+            f"{metrics.get('power1_ratio', 0.0):.6f},"
+            f"{metrics.get('power2_ratio', 0.0):.6f},"
+            f"{metrics.get('stone0_ratio', 0.0):.6f},"
+            f"{metrics.get('stone1_ratio', 0.0):.6f},"
+            f"{metrics.get('stone2_ratio', 0.0):.6f}\n"
+        )
+
+
 def find_latest_checkpoint(
     checkpoint_dir: str = "checkpoints",
-) -> tuple[str | None, int]:
-    """
-    checkpoint_dir 안에서 policy_epoch_XXXXXX.pt 중
-    가장 큰 epoch 번호를 가진 파일을 찾아서 (path, epoch)를 반환.
-    없으면 (None, 0).
-    """
+) -> Tuple[str | None, int]:
     os.makedirs(checkpoint_dir, exist_ok=True)
     ckpts = sorted(Path(checkpoint_dir).glob("policy_epoch_*.pt"))
     if not ckpts:
         return None, 0
 
     latest = ckpts[-1]
-    stem = latest.stem  # e.g. "policy_epoch_001470"
+    stem = latest.stem
     epoch = 0
     parts = stem.split("_")
     if len(parts) >= 3 and parts[-1].isdigit():
         epoch = int(parts[-1])
     else:
-        # 실패하면 마지막 6자리만 시도
         try:
             epoch = int(stem[-6:])
         except ValueError:
@@ -1027,7 +1209,7 @@ def find_latest_checkpoint(
 
 
 # ------------------------------------------------
-# 리그 self-play 학습 루프 (CTDE + potential shaping)
+# 리그 self-play 학습 루프
 # ------------------------------------------------
 def train_league_selfplay(
     num_epochs: int = 5,
@@ -1039,39 +1221,49 @@ def train_league_selfplay(
     max_checkpoints: int = 20,
     log_path: str = "training_metrics.csv",
     max_players: int = 50,
-    # ★ 이어학습용: 외부에서 learner 넘겨받기 + epoch 시작 위치
     existing_learner: PPOPolicy | None = None,
     start_epoch: int = 0,
-) -> tuple[PPOPolicy, EloLeague]:
+) -> Tuple[PPOPolicy, EloLeague]:
     """
-    ELO 리그 기반 self-play 학습 루프 (CTDE + potential-based shaping + final diff 보정 + 디버깅).
+    ELO 리그 기반 self-play 학습 루프.
 
-    - existing_learner가 None이면 새로 PPOPolicy 생성
-    - start_epoch부터 epoch 번호를 이어서 사용
+    RL 타임스텝(학습 기준):
+      - 상태 s_t: learner_color의 턴에서 보이는 보드 상태
+      - 행동: learner가 쏜 샷
+      - 다음 상태 s_{t+1}: 다음에 learner_color에게 턴이 돌아왔을 때 보드 상태
+        (그 사이에 env.step은 여러 번 발생할 수 있음: 내 샷 + 상대 응수들)
+
+    reward:
+      - base_step:
+          * env step당 STEP_PENALTY 누적
+          * segment 전체에서 alive_diff 변화에 ALIVE_TRADE_WEIGHT 반영
+      - shaping:
+          * potential-based: γ Φ(s_{t+1}) - Φ(s_t)
+      - episode 마지막 스텝:
+          * 최종 alive_diff에 따른 WIN_REWARD (판정승 포함)
+          * truncated도 포함해서 "여기서 게임 끝"으로 간주 (GAE bootstrap 없음)
     """
-
     if config is None:
         config = PPOConfig()
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-    # ★ 인간 렌더링 모드로 환경 생성
     env = make_env(render_mode=None, bgm=False)
 
-    # learner 초기화 또는 이어받기
+    # learner 초기화/이어학습
     if existing_learner is None:
         learner = PPOPolicy(device=device, lr=config.learning_rate)
-        print("[TRAIN] No existing learner, initialize new policy.")
+        print("[TRAIN] Initialize new learner.")
     else:
         learner = existing_learner
-        # 혹시 device가 바뀌었을 수 있으니 to(device)
         learner.device = device
         learner.actor.to(device)
         learner.critic.to(device)
-        print(f"[TRAIN] Using existing learner, start_epoch={start_epoch}")
+        print(f"[TRAIN] Continue from existing learner, start_epoch={start_epoch}")
 
-    # 초기 snapshot 생성 (현재 learner 기준)
-    snap0 = clone_policy(learner)
+    # 첫 스냅샷
+    snap0 = PPOPolicy(device=device, lr=config.learning_rate)
+    snap0.actor.load_state_dict(learner.actor.state_dict())
+    snap0.critic.load_state_dict(learner.critic.state_dict())
 
     league = EloLeague(
         players=[
@@ -1083,110 +1275,185 @@ def train_league_selfplay(
     )
     snapshot_counter = 1
 
-    # ★ epoch 인덱스를 start_epoch에서 이어서 진행
     for epoch_idx in range(start_epoch + 1, start_epoch + num_epochs + 1):
-        all_actor_states = []
-        all_critic_states = []
-        all_actions = []
-        all_logprobs = []
-        all_advantages = []
-        all_returns = []
+        all_actor_states: List[torch.Tensor] = []
+        all_critic_states: List[torch.Tensor] = []
+        all_actions: List[int] = []
+        all_logprobs: List[float] = []
+        all_advantages: List[float] = []
+        all_returns: List[float] = []
 
-        # epoch 메트릭
         ep_wins = ep_draws = ep_losses = 0
-        ep_reward_sum = 0.0
+        ep_alive_diff_sum = 0.0
         ep_step_sum = 0
         episodes_this_epoch = 0
+        episode_steps_list: List[int] = []
 
-        # ===========================================================
-        #                   에피소드 반복
-        # ===========================================================
+        # 리워드 breakdown 누적 (epoch 단위)
+        epoch_step_penalty_sum = 0.0
+        epoch_trade_sum = 0.0
+        epoch_shaping_sum = 0.0
+        epoch_game_reward_sum = 0.0
+
+        # potential magnitude / segment 카운트
+        epoch_phi_abs_sum = 0.0
+        epoch_segment_count = 0
+
+        # early behaviour (learner 첫 3턴 기준)
+        epoch_early_my_alive_sum = 0.0
+        epoch_early_opp_alive_sum = 0.0
+        epoch_early_alive_episodes = 0
+        epoch_early_alive_drop_episodes = 0
+        epoch_early_power_sum = 0.0
+        epoch_early_power_episodes = 0
+
         for ep in range(episodes_per_epoch):
-
             opponent = league.choose_opponent("learner")
 
+            # learner_color: 0(흑) 또는 1(백)
             learner_color = int(np.random.randint(0, 2))
 
-            # seed도 epoch_idx 기준으로
             global_seed = (epoch_idx - 1) * episodes_per_epoch + ep
             obs, info = env.reset(seed=global_seed)
 
             done = False
             step = 0
             truncated = False
+            terminated = False
 
-            ep_actor_states = []
-            ep_critic_states = []
-            ep_actions = []
-            ep_logprobs = []
-            ep_rewards = []
+            ep_actor_states: List[torch.Tensor] = []
+            ep_critic_states: List[torch.Tensor] = []
+            ep_actions: List[int] = []
+            ep_logprobs: List[float] = []
+            ep_rewards: List[float] = []
 
-            last_step_by_learner = False
+            # 리워드 breakdown (episode 단위)
+            ep_step_penalty_sum = 0.0
+            ep_trade_sum = 0.0
+            ep_shaping_sum = 0.0
+            ep_game_reward_sum = 0.0
 
-            # ===========================================================
-            #                     에피소드 진행 (step loop)
-            # ===========================================================
-            while not done:
-                turn = int(obs["turn"])
-                learner_turn = (turn == learner_color)
+            # potential magnitude / segment (episode 단위)
+            ep_phi_abs_sum = 0.0
+            ep_segment_count = 0
 
-                if learner_turn:
-                    # 위치 기반 potential: 현재 형세
-                    phi_before = potential(obs, my_color=learner_color)
+            # early behaviour (episode 단위)
+            early_my_alive_list: List[float] = []
+            early_opp_alive_list: List[float] = []
+            early_powers: List[float] = []
+            learner_turn_count = 0
 
-                    (action, action_idx, logprob,
-                     actor_state_vec, critic_state_vec) = learner.act_train(
-                        observation=obs,
-                        my_color=learner_color
-                    )
-
-                    ep_actor_states.append(actor_state_vec.cpu())
-                    ep_critic_states.append(critic_state_vec.cpu())
-                    ep_actions.append(action_idx)
-                    ep_logprobs.append(logprob)
-
-                    last_step_by_learner = True
-
-                else:
-                    action = opponent.policy.act_eval(
-                        observation=obs,
-                        my_color=turn,
-                        greedy=False
-                    )
-                    last_step_by_learner = False
-
-                obs_next, reward_env, terminated, truncated, info = env.step(action)
+            # --- 처음 learner에게 턴이 올 때까지 opponent만 두게 함 ---
+            while not done and int(obs["turn"]) != learner_color:
+                opp_turn_color = int(obs["turn"])
+                opp_action = opponent.policy.act_eval(
+                    observation=obs,
+                    my_color=opp_turn_color,
+                    greedy=False,
+                )
+                obs, _, terminated, truncated, info = env.step(opp_action)
                 done = terminated or truncated
                 step += 1
 
-                # =============================
-                #   Reward shaping (learner)
-                # =============================
-                if learner_turn:
-                    # 시간 패널티
-                    base_reward = -STEP_PENALTY
+            # 에피소드 내 메인 루프: "내 턴 기준" 타임스텝
+            while not done:
+                # s_t: learner 턴 시작 상태
+                turn = int(obs["turn"])
+                assert turn == learner_color, "내 턴일 때만 이 블록에 들어와야 함."
 
-                    # 위치 형세 potential: Φ_geo(s'), Φ_geo(s)
-                    phi_after = potential(obs_next, my_color=learner_color)
+                # early behaviour용 alive 카운트
+                my_alive, opp_alive = compute_alive_counts(obs, my_color=learner_color)
+                learner_turn_count += 1
+                if learner_turn_count <= 3:
+                    early_my_alive_list.append(my_alive)
+                    early_opp_alive_list.append(opp_alive)
 
-                    # potential-based shaping: r' = r_base + γ Φ(s') - Φ(s)
-                    shaped_r = base_reward + config.gamma * phi_after - phi_before
+                # actor/critic 입력 상태 저장 + 행동 샘플링
+                (
+                    action,
+                    action_idx,
+                    logprob,
+                    actor_state_vec,
+                    critic_state_vec,
+                ) = learner.act_train(
+                    observation=obs,
+                    my_color=learner_color,
+                )
 
-                    ep_rewards.append(shaped_r)
+                power_used = float(action["power"])
+                if learner_turn_count <= 3:
+                    early_powers.append(power_used)
 
-                obs = obs_next
+                ep_actor_states.append(actor_state_vec.cpu())
+                ep_critic_states.append(critic_state_vec.cpu())
+                ep_actions.append(action_idx)
+                ep_logprobs.append(logprob)
 
-            # ===========================================================
-            #               에피소드 종료 처리 (승패/ELO/GAE)
-            # ===========================================================
-            R_learner = compute_alive_diff(obs, my_color=learner_color)  # [-3, +3]
+                # base/alive 기준 상태
+                alive_before = my_alive - opp_alive
+                phi_before = potential(obs, my_color=learner_color)
 
-            # 로그용 (평균 alive_diff)
-            ep_reward_sum += R_learner
+                # potential magnitude 추적
+                ep_phi_abs_sum += abs(phi_before)
+                ep_segment_count += 1
+
+                # --- learner 샷 ---
+                obs, _, terminated, truncated, info = env.step(action)
+                done = terminated or truncated
+                step += 1
+
+                # env step당 패널티: 이번 segment의 첫 step
+                segment_steps = 1
+                step_penalty_accum = -STEP_PENALTY
+
+                # --- 다음 learner 턴이 오거나 에피소드가 끝날 때까지 opponent 차례 ---
+                while not done and int(obs["turn"]) != learner_color:
+                    opp_turn_color = int(obs["turn"])
+                    opp_action = opponent.policy.act_eval(
+                        observation=obs,
+                        my_color=opp_turn_color,
+                        greedy=False,
+                    )
+                    obs, _, terminated, truncated, info = env.step(opp_action)
+                    done = terminated or truncated
+                    step += 1
+
+                    segment_steps += 1
+                    step_penalty_accum -= STEP_PENALTY
+
+                # segment 끝: s_{t+1} (다음 learner 턴 시작 상태 또는 terminal)
+                alive_after = compute_alive_diff(obs, my_color=learner_color)
+                delta_alive = alive_after - alive_before
+                r_trade = ALIVE_TRADE_WEIGHT * delta_alive
+
+                base_step = step_penalty_accum + r_trade
+
+                # terminal에서는 Φ(s_{t+1}) = 0으로 처리 (potential-based shaping 이론 정합성 보강)
+                if done:
+                    phi_after = 0.0
+                else:
+                    phi_after = potential(obs, my_color=learner_color)
+
+                shaping_term = config.gamma * phi_after - phi_before
+                shaped_r = base_step + shaping_term
+
+                ep_rewards.append(shaped_r)
+
+                # breakdown 누적
+                ep_step_penalty_sum += step_penalty_accum
+                ep_trade_sum += r_trade
+                ep_shaping_sum += shaping_term
+
+                # done이면 while 탈출, 아니면 다음 learner 턴으로 계속
+                # obs는 이미 "다음 learner 턴 시작 상태" (또는 terminal)
+
+            # 에피소드 종료 후 alive_diff 기준 승/무/패 판단
+            R_learner = compute_alive_diff(obs, my_color=learner_color)
+            ep_alive_diff_sum += R_learner
             ep_step_sum += step
             episodes_this_epoch += 1
+            episode_steps_list.append(step)
 
-            # ELO용 스코어 (승/무/패)
             if R_learner > 0:
                 score_a = 1.0
                 ep_wins += 1
@@ -1199,45 +1466,37 @@ def train_league_selfplay(
 
             league.update_result("learner", opponent.id, score_a)
 
-            # -----------------------------
-            #   최종 승패 보상(game_reward)
-            # -----------------------------
-            game_reward = 0.0
-            if not truncated:
-                # 단순 승/패 보상 (원하면 스케일 조정 가능)
-                if R_learner > 0:
-                    game_reward = 1.0
-                elif R_learner < 0:
-                    game_reward = -1.0
-                else:
-                    game_reward = 0.0  # 무승부
+            # 최종 승/패 보상: truncated 여부와 관계없이 alive_diff 판정으로 반영
+            if R_learner > 0:
+                game_reward = WIN_REWARD
+            elif R_learner < 0:
+                game_reward = -WIN_REWARD
+            else:
+                game_reward = 0.0
 
-                # 마지막 learner 스텝에 최종 보상 얹기
-                if len(ep_rewards) > 0:
-                    ep_rewards[-1] += game_reward
-
-            # ---- GAE 계산 ----
             if len(ep_rewards) > 0:
+                ep_rewards[-1] += game_reward
+                ep_game_reward_sum += game_reward
+            # 만약 learner가 한 번도 두지 못하고 끝났다면(ep_rewards 비어있음) 그 에피소드는 학습에 쓰지 않음.
 
+            # GAE
+            if len(ep_rewards) > 0:
                 rewards_np = np.array(ep_rewards, dtype=np.float32)
 
                 critic_states_ep = torch.stack(ep_critic_states).to(device)
                 with torch.no_grad():
                     values_t = learner.critic(critic_states_ep).cpu().numpy()
 
-                if truncated:
-                    last_state = encode_state_central_tensor(obs, device=device).unsqueeze(0)
-                    with torch.no_grad():
-                        bootstrap_value_last = learner.critic(last_state).item()
-                else:
-                    bootstrap_value_last = 0.0
+                # 여기서는 truncated도 포함해서 "판정 종료된 terminal"로 취급하므로
+                # 더 이상 미래 value를 bootstrap 하지 않는다.
+                bootstrap_value_last = 0.0
 
                 adv_np, ret_np = compute_gae_returns(
                     rewards=rewards_np,
                     values=values_t,
                     gamma=config.gamma,
                     lam=config.gae_lambda,
-                    bootstrap_value_last=bootstrap_value_last
+                    bootstrap_value_last=bootstrap_value_last,
                 )
 
                 all_actor_states.extend(ep_actor_states)
@@ -1247,34 +1506,113 @@ def train_league_selfplay(
                 all_advantages.extend(adv_np.tolist())
                 all_returns.extend(ret_np.tolist())
 
-        # ===========================================================
-        #                  Epoch summary & PPO update
-        # ===========================================================
+            # 에피소드 리워드 breakdown을 epoch 누적
+            epoch_step_penalty_sum += ep_step_penalty_sum
+            epoch_trade_sum += ep_trade_sum
+            epoch_shaping_sum += ep_shaping_sum
+            epoch_game_reward_sum += ep_game_reward_sum
+
+            # potential magnitude / segment count 누적
+            epoch_phi_abs_sum += ep_phi_abs_sum
+            epoch_segment_count += ep_segment_count
+
+            # early behaviour 누적
+            if len(early_my_alive_list) > 0:
+                mean_my_alive = float(np.mean(early_my_alive_list))
+                mean_opp_alive = float(np.mean(early_opp_alive_list))
+                epoch_early_my_alive_sum += mean_my_alive
+                epoch_early_opp_alive_sum += mean_opp_alive
+                epoch_early_alive_episodes += 1
+                if min(early_my_alive_list) <= 1.0:
+                    epoch_early_alive_drop_episodes += 1
+
+            if len(early_powers) > 0:
+                mean_power_ep = float(np.mean(early_powers))
+                epoch_early_power_sum += mean_power_ep
+                epoch_early_power_episodes += 1
+
+        # --- epoch 통계/로그 ---
         if episodes_this_epoch > 0:
-            avg_R = ep_reward_sum / episodes_this_epoch
+            avg_alive_diff = ep_alive_diff_sum / episodes_this_epoch
             avg_steps = ep_step_sum / episodes_this_epoch
+
+            avg_step_penalty = epoch_step_penalty_sum / episodes_this_epoch
+            avg_trade = epoch_trade_sum / episodes_this_epoch
+            avg_shaping = epoch_shaping_sum / episodes_this_epoch
+            avg_game_reward = epoch_game_reward_sum / episodes_this_epoch
+
+            steps_arr = np.array(episode_steps_list, dtype=np.float32)
+            steps_p50 = float(np.percentile(steps_arr, 50))
+            steps_p90 = float(np.percentile(steps_arr, 90))
+            steps_max = float(steps_arr.max())
         else:
-            avg_R = 0.0
+            avg_alive_diff = 0.0
             avg_steps = 0.0
+            avg_step_penalty = 0.0
+            avg_trade = 0.0
+            avg_shaping = 0.0
+            avg_game_reward = 0.0
+            steps_p50 = 0.0
+            steps_p90 = 0.0
+            steps_max = 0.0
+
+        if epoch_segment_count > 0:
+            avg_phi_abs = epoch_phi_abs_sum / epoch_segment_count
+        else:
+            avg_phi_abs = 0.0
+
+        if epoch_early_alive_episodes > 0:
+            early_my_alive_avg = epoch_early_my_alive_sum / epoch_early_alive_episodes
+            early_opp_alive_avg = epoch_early_opp_alive_sum / epoch_early_alive_episodes
+            early_alive_drop_ratio = epoch_early_alive_drop_episodes / epoch_early_alive_episodes
+        else:
+            early_my_alive_avg = 0.0
+            early_opp_alive_avg = 0.0
+            early_alive_drop_ratio = 0.0
+
+        if epoch_early_power_episodes > 0:
+            early_avg_power = epoch_early_power_sum / epoch_early_power_episodes
+        else:
+            early_avg_power = 0.0
 
         learner_rating = league.players[league.find_index("learner")].rating
 
+        # 2번 CSV: 성능/리그 + early behaviour
         append_epoch_log(
             epoch=epoch_idx,
             episodes=episodes_this_epoch,
             wins=ep_wins,
             draws=ep_draws,
             losses=ep_losses,
-            avg_reward=avg_R,
+            avg_alive_diff=avg_alive_diff,
             avg_steps=avg_steps,
+            steps_p50=steps_p50,
+            steps_p90=steps_p90,
+            steps_max=steps_max,
             learner_rating=learner_rating,
             num_players=len(league.players),
+            early_my_alive_avg=early_my_alive_avg,
+            early_opp_alive_avg=early_opp_alive_avg,
+            early_alive_drop_ratio=early_alive_drop_ratio,
+            early_avg_power=early_avg_power,
             log_path=log_path,
         )
 
-        # PPO update
+        # 1번 CSV: 리워드 breakdown
+        append_reward_breakdown_log(
+            epoch=epoch_idx,
+            episodes=episodes_this_epoch,
+            avg_step_penalty=avg_step_penalty,
+            avg_trade=avg_trade,
+            avg_shaping=avg_shaping,
+            avg_game_reward=avg_game_reward,
+            avg_phi_abs=avg_phi_abs,
+            log_path="reward_breakdown_metrics.csv",
+        )
+
+        # --- PPO 업데이트 + 3번 CSV(PPO diagnostics) ---
         if len(all_actor_states) > 0:
-            ppo_update(
+            ppo_metrics = ppo_update(
                 policy=learner,
                 actor_states=all_actor_states,
                 critic_states=all_critic_states,
@@ -1284,8 +1622,14 @@ def train_league_selfplay(
                 returns=all_returns,
                 config=config,
             )
+            append_ppo_metrics_log(
+                epoch=epoch_idx,
+                num_samples=len(all_actor_states),
+                metrics=ppo_metrics,
+                log_path="ppo_diagnostics_metrics.csv",
+            )
 
-        # checkpoint
+        # --- 체크포인트 저장 ---
         if epoch_idx % checkpoint_interval == 0:
             save_checkpoint_policy(
                 learner,
@@ -1294,13 +1638,15 @@ def train_league_selfplay(
                 max_keep=max_checkpoints,
             )
 
-        # snapshot
+        # --- snapshot 추가 & 오래된 플레이어 정리 ---
         if epoch_idx % snapshot_interval == 0:
-            snap_policy = clone_policy(learner)
+            snap_policy = PPOPolicy(device=device, lr=config.learning_rate)
+            snap_policy.actor.load_state_dict(learner.actor.state_dict())
+            snap_policy.critic.load_state_dict(learner.critic.state_dict())
+
             snap_id = f"snap_{snapshot_counter:03d}"
             snapshot_counter += 1
 
-            # 새 snapshot 추가
             league.players.append(
                 RatedPolicy(
                     id=snap_id,
@@ -1310,20 +1656,15 @@ def train_league_selfplay(
                 )
             )
 
-            # ★ max_players=50 유지: learner를 제외한 가장 오래된 snapshot부터 삭제
             while len(league.players) > max_players:
-                # learner는 항상 남겨두고, 제일 앞에서부터 learner가 아닌 놈을 제거
                 remove_idx = None
                 for i, p in enumerate(league.players):
                     if p.id != "learner":
                         remove_idx = i
                         break
-
-                # 이론상 항상 찾지만, 방어적으로 체크
                 if remove_idx is not None:
                     del league.players[remove_idx]
                 else:
-                    # 혹시나 learner 하나만 남은 상태에서 꼬이면 루프 탈출
                     break
 
     env.close()
@@ -1345,8 +1686,7 @@ class YourBlackAgent(kym.Agent):
             self.policy = policy
 
     def act(self, observation, info):
-        # 흑 기준 my_color=0 (평가에서는 greedy=True 기본)
-        return self.policy.act_eval(observation, my_color=0)
+        return self.policy.act_eval(observation, my_color=0, greedy=True)
 
     def save(self, path: str) -> None:
         self.policy.save(path)
@@ -1369,8 +1709,7 @@ class YourWhiteAgent(kym.Agent):
             self.policy = policy
 
     def act(self, observation, info):
-        # 백 기준 my_color=1
-        return self.policy.act_eval(observation, my_color=1)
+        return self.policy.act_eval(observation, my_color=1, greedy=True)
 
     def save(self, path: str) -> None:
         self.policy.save(path)
@@ -1386,16 +1725,26 @@ class YourWhiteAgent(kym.Agent):
 # ------------------------------------------------
 def main_train():
     """
-    학습 전용 엔트리포인트.
-    - ELO 리그 self-play (CTDE + potential shaping)로 learner 학습
-    - 최종 learner policy를 'shared_policy.pt'로 저장
-    - 체크포인트가 있으면 최신에서 이어학습, 없으면 처음부터
+    - env reward는 0, 여기서 정의한 base + shaping으로만 학습.
+    - base:
+        * env step당 STEP_PENALTY (segment 단위로 누적)
+        * segment 단위 Δalive_diff * ALIVE_TRADE_WEIGHT
+        * 에피소드 종료시 WIN_REWARD (alive_diff 판정)
+    - shaping:
+        * potential-based Φ_safe + Φ_center
+          (RL 타임스텝: 내 턴 s_t → 다음 내 턴 s_{t+1} 기준, γ Φ(s') - Φ(s))
+    - ELO 리그 self-play
+    - truncated도 포함해서 "alive_diff로 판정 끝난 시점"을 terminal로 사용
+    - CSV:
+        * training_metrics.csv            : 승률/스텝/ELO 등 + early behaviour (2번)
+        * reward_breakdown_metrics.csv    : 리워드 구성 요소 + potential magnitude (1번)
+        * ppo_diagnostics_metrics.csv     : PPO/정책 형태 진단 + 액션 분포 (3번)
     """
     config = PPOConfig(
         gamma=0.99,
         gae_lambda=0.95,
         clip_coef=0.2,
-        ent_coef=0.005,
+        ent_coef=0.01,   # 엔트로피 계수 상향
         vf_coef=0.5,
         max_grad_norm=0.5,
         learning_rate=1e-4,
@@ -1406,7 +1755,6 @@ def main_train():
     checkpoint_dir = "checkpoints"
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    # ★ 최신 체크포인트 탐색
     latest_ckpt, last_epoch = find_latest_checkpoint(checkpoint_dir)
 
     if latest_ckpt is not None:
@@ -1423,7 +1771,7 @@ def main_train():
         start_epoch = 0
 
     learner, league = train_league_selfplay(
-        num_epochs=100000000,  # 계속 이어서 갈 거라 사실상 무한
+        num_epochs=100000000,
         episodes_per_epoch=50,
         snapshot_interval=5,
         config=config,
@@ -1436,7 +1784,6 @@ def main_train():
         start_epoch=start_epoch,
     )
 
-    # 최종 learner 정책 저장
     weight_path = "shared_policy.pt"
     learner.save(weight_path)
 

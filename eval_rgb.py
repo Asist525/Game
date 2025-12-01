@@ -426,8 +426,8 @@ def main(
 # ------------------------------------------------
 if __name__ == "__main__":
     # 기본 weight 경로 (필요에 따라 수정)
-    black_path = r"/home/ubuntu/alkhagi/Game/checkpoints/policy_epoch_002300.pt"
-    white_path = r"/home/ubuntu/alkhagi/Game/checkpoints/policy_epoch_002300.pt"
+    black_path = r"/home/ubuntu/alkhagi/Game/checkpoints/policy_epoch_006780.pt"
+    white_path = r"/home/ubuntu/alkhagi/Game/checkpoints/policy_epoch_006780.pt"
 
     # 기본 에피소드 수
     num_episodes = 50
@@ -442,7 +442,7 @@ if __name__ == "__main__":
             num_episodes = int(arg.split("=", 1)[1])
 
     main(
-        render_mode=None,
+        render_mode="human",
         black_weight=black_path,
         white_weight=white_path,
         num_episodes=num_episodes,

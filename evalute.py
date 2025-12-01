@@ -82,8 +82,8 @@ def evaluate_human(
 
 if __name__ == "__main__":
     # 기본 weight 경로 (필요에 따라 수정)
-    black_path = r"/home/ubuntu/alkhagi/Game/checkpoints/policy_epoch_002300.pt"
-    white_path = r"/home/ubuntu/alkhagi/Game/checkpoints/policy_epoch_002300.pt"
+    black_path = r"/home/ubuntu/alkhagi/Game/checkpoints/policy_epoch_006110.pt"
+    white_path = r"/home/ubuntu/alkhagi/Game/checkpoints/policy_epoch_006290.pt"
     episodes = 1
 
     # CLI 인자 파싱: black=..., white=..., episodes=...
